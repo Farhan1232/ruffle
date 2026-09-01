@@ -3,6 +3,8 @@ player-settings = Pengaturan Pemutar
 movie-parameters = Parameter Film Flash
 custom-base-url = URL dasar khusus
 spoof-swf-url = URL SWF Buatan
+referer-url = Referer URL
+cookie = Cookie
 proxy = Proksi
 upgrade-http = Tingkatkan HTTP ke HTTPS
 tcp-connections = Koneksi TCP
@@ -44,8 +46,32 @@ align-top-right = Atas-kanan
 align-bottom-right = Bawah-kanan
 align-force = Paksa
 scale-mode = Moda Skala
+scale-mode-noscale = Tanpa skala (100%)
+scale-mode-noscale-tooltip =
+    Menampilkan SWF pada ukuran aslinya, tanpa zoom.
+    
+    Sesuai dengan StageScaleMode.NO_SCALE
+scale-mode-showall = Zoom agar sesuai
+scale-mode-showall-tooltip =
+    Memperbesar SWF untuk memenuhi jendela sebesar mungkin tanpa pemotongan, dengan mempertahankan rasio aspek.
+    
+    Sesuai dengan StageScaleMode.SHOW_ALL
+scale-mode-exactfit = Bentangkan agar Pas
+scale-mode-exactfit-tooltip =
+    Memastikan SWF memenuhkan jendela, mengabaikan rasio aspek.
+    
+    Sesuai dengan StageScaleMode.EXACT_FIT
+scale-mode-noborder = Potong agar Pas
+scale-mode-noborder-tooltip =
+    Memenuhi seluruh jendela sambil mempertahankan rasio aspek, dan memotong SWF jika diperlukan.
+    
+    Sesuai dengan StageScaleMode.NO_BORDER
 scale-mode-force = Paksa
+scale-mode-force-tooltip = Mencegah film mengubah mode skala, dengan mengunci pengaturan yang dipilih.
 player-version = Versi Pemutar
+player-runtime = Runtime pemutar
+player-runtime-flash = Flash Player
+player-runtime-air = Adobe AIR
 custom-framerate = Framerate Khusus
 custom-framerate-suffix = { " " } fps
 dummy-external-interface = External Interface Buatan
