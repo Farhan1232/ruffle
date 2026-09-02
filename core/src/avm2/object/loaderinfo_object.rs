@@ -239,6 +239,15 @@ impl<'gc> LoaderInfoObject<'gc> {
         true
     }
 
+    /// Whether `object` is the content this loader currently holds.
+    pub fn content_is(self, object: DisplayObject<'gc>) -> bool {
+        match &*self.loader_stream() {
+            LoaderStream::Swf(_, root) => DisplayObject::ptr_eq(*root, object),
+            LoaderStream::NotYetLoaded(_, Some(root), _) => DisplayObject::ptr_eq(*root, object),
+            LoaderStream::NotYetLoaded(_, None, _) => false,
+        }
+    }
+
     /// Unwrap this object's loader stream
     pub fn loader_stream(self) -> Ref<'gc, LoaderStream<'gc>> {
         Gc::as_ref(self.0).loaded_stream.borrow()

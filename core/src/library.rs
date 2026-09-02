@@ -241,7 +241,7 @@ unsafe impl<'gc> Collect<'gc> for MovieLibrary<'gc> {
 /// A tracer that resurrects instead of marks: every strong pointer it is
 /// handed is brought back for the current collection cycle, along with -
 /// once marking resumes - everything reachable from it.
-struct Resurrector<'a, 'gc>(&'a Finalization<'gc>);
+pub(crate) struct Resurrector<'a, 'gc>(pub(crate) &'a Finalization<'gc>);
 
 impl<'gc> Trace<'gc> for Resurrector<'_, 'gc> {
     fn trace_gc(&mut self, gc: Gc<'gc, ()>) {
@@ -877,17 +877,31 @@ impl<'gc> Library<'gc> {
     /// every cycle: an untraced library whose contents were neither
     /// resurrected nor dropped would be left pointing at swept objects.
     pub fn resolve_releasable_libraries(&mut self, fc: &Finalization<'gc>) -> bool {
-        if self.movie_libraries.resurrect_needed(fc) {
+        if self.resurrect_needed_libraries(fc) {
             return true;
         }
+        self.release_unneeded_libraries(fc);
+        false
+    }
 
+    /// The first half of [`Self::resolve_releasable_libraries`]: resurrects
+    /// the contents of every library something still reaches, and returns
+    /// whether any was. The caller resumes marking after each round in which
+    /// this returns `true`.
+    pub fn resurrect_needed_libraries(&mut self, fc: &Finalization<'gc>) -> bool {
+        self.movie_libraries.resurrect_needed(fc)
+    }
+
+    /// The second half of [`Self::resolve_releasable_libraries`], for once
+    /// nothing more can be resurrected: drops the libraries that were not
+    /// kept, forgets dead classes and reports the memory still held.
+    pub fn release_unneeded_libraries(&mut self, fc: &Finalization<'gc>) {
         let dropped = self.movie_libraries.drop_unneeded(fc);
         if dropped > 0 {
             tracing::debug!("Released {dropped} unreachable movie librar(y/ies)");
         }
         self.avm2_class_registry.remove_dead_classes(fc);
         self.report_external_allocation(fc);
-        false
     }
 
     /// Keeps the collector's idea of how much memory is in play in step with

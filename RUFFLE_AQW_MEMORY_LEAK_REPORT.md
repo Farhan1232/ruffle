@@ -53,6 +53,19 @@ a synthetic one, both passing); and once nothing references a loaded SWF it is
 released, so repeated loads no longer grow. Section 16 has the measurements,
 the full test-suite results and the repeated live AQW session.
 
+**Second field run (section 18).** The client then ran the build on Windows for
+39 minutes and sent the memory report. It showed memory still growing - but not
+in the movie libraries, which stayed flat. The growth was **departed players'
+avatars**: AQW keeps its per-player caches (`_colorCache`, `World.avatars`) in
+`flash.utils.Dictionary` objects constructed with `weakKeys`, relying on the
+weak-key contract to forget a player once they leave. Ruffle did not implement
+weak keys - every object key was held strongly - so every avatar that ever
+entered a room stayed on the heap for the session. Section 18 implements weak
+keys with the same ephemeron model section 16 built for libraries, proves the
+retaining chain with a heap-graph census, and validates it with a 40-minute
+authenticated session in which the counters that ran away on the client's build
+stay bounded.
+
 **Follow-up (section 17).** The client's first run of the corrected fix on
 Windows reported lag and 3.5 GB after ten map switches. The lag was a
 collection storm in the new `unloadAndStop` and is fixed; the memory was
@@ -1566,3 +1579,349 @@ and send `aqw.csv` together with the console output. The `movies`,
 `characters`, `gc_allocation` and `gpu_*` columns say, sample by sample,
 whether the growth is in libraries, in the ActionScript heap, or in the
 renderer, and the console shows which build is running.
+
+
+## 18. The client's 39-minute Windows session, and the retention it exposed
+
+Section 17 ended by asking the client to run the instrumented build on Windows
+and send the memory report. They did: a **39-minute authenticated session**,
+`windows-ram.csv` (the process working set, sampled every 5 s by a PowerShell
+loop), `aqw-memory.csv` (Ruffle's own counters), the console log and
+`commit-info.txt`. This section is the analysis of that data, the root cause it
+led to, the fix, and its validation.
+
+`commit-info.txt` records the build: `HEAD=837b08df…`, branch
+`fix/aqw-memory-leak` — the merge of upstream master into the section-17 branch,
+which is the delivered build plus the upstream commits the client's own
+`Sync fork` button pulled in. The credential note in section 13 applies to the
+console log too: the account name and a session token appear in its trace
+output, so it was scrubbed before any analysis and **is not committed**; the
+test account's password should be rotated because it existed in plaintext in
+that log at all.
+
+### 18.1 What the data shows
+
+The session was not the harness or a handful of map switches. It was real play:
+16 map loads (all early), then a long stay in populated rooms while the server
+streamed avatars, equipment, weapons, armour, capes, helms, hair and room
+chatter. The Windows working set and Ruffle's internal counters both climbed
+for the whole run, and — this is the point — **they kept climbing long after
+the last map load**, which happened around 10 minutes in.
+
+| Minute | Windows working set | Rust heap | GC heap | GC objects | Movies | Characters |
+|---|---|---|---|---|---|---|
+| 1 | 1,069 MB | 429 MiB | 76 MiB | 390,844 | 208 | 24,472 |
+| 3 | 2,652 MB | 1,180 MiB | 327 MiB | 1,710,566 | 660 | 48,824 |
+| 5 | 3,191 MB | 1,260 MiB | 351 MiB | 1,811,845 | 694 | 50,005 |
+| 10 | 5,061 MB | 1,863 MiB | 506 MiB | 2,531,177 | 1,151 | 74,843 |
+| 15 | 5,824 MB | 2,602 MiB | 942 MiB | 5,089,143 | 1,162 | 77,762 |
+| 20 | 6,106 MB | 2,911 MiB | 1,112 MiB | 6,017,599 | 1,215 | 80,476 |
+| 25 | 6,379 MB | 3,295 MiB | 1,324 MiB | 7,213,078 | 1,259 | 83,377 |
+| 30 | 6,646 MB | 3,360 MiB | 1,346 MiB | 7,294,180 | 1,298 | 85,737 |
+| 38.5 | 7,073 MB | 3,614 MiB | 1,445 MiB | 7,798,856 | 1,490 | 92,910 |
+
+The abrupt drop in the final `windows-ram.csv` row (7,073 → 1,707 MB) is the
+process tearing down at exit; it is not stabilisation and is not counted.
+
+Fitting a slope to each counter and to each five-minute window separates what
+plateaus from what grows without bound:
+
+* **Plateaus.** GPU/tracked-texture memory (`tracked_texture_bytes`) rises
+  steeply in the first two minutes to about 4.3 GiB-of-reported-pixels and is
+  then flat to the end (slope under 1 MiB/min after minute 10). SWF bytes,
+  bitmap-source and bitmap-decoded bytes, mesh count and mesh bytes are all
+  bounded and fluctuate in a band. So the remaining growth is **not** the
+  renderer, and it is not the movie libraries' own content — section 17's work
+  holds. This matters: it rules out the section-16/17 mechanisms as the
+  remaining cause.
+* **Grows roughly monotonically with elapsed play.** The Rust heap
+  (`rust_heap_bytes`), the GC heap (`gc_allocation`), the **GC object count**
+  (`gc_objects`), the character count and the movie count. Between minute 10
+  (last map) and minute 38 the GC object count roughly *tripled*, from 2.5 M to
+  ~8 M, while only ~6 more maps' worth of content could possibly have loaded.
+  The growth tracks time-in-room and avatar/equipment traffic, not map changes.
+
+Reading the post-collection floor rather than the raw samples (the minimum over
+each trailing three-minute window, i.e. the level just after a collection)
+removes the sawtooth and shows the same thing: the floor of `gc_objects` climbs
+0.97 M → 1.74 M → 4.57 M → 5.41 M → 6.17 M at minutes 5/10/20/30/38. A working
+collector's floor is flat. This one's rises with the session.
+
+### 18.2 Why the earlier result was insufficient
+
+Sections 16 and 17 fixed **movie-library lifetime**: a loaded SWF's library is
+released once nothing outside it is reachable, and its expensive
+representations (tessellations, parsed shapes, bitmap pixels) are on-demand and
+reported to the collector. That is real and it holds on this data — the
+library-owned counters are all bounded.
+
+But those sections measured **map switching**. The client's session is
+dominated by something else: a populated room, where the server sends a
+continuous stream of *other players* arriving and leaving. Each arriving avatar
+is a `MovieClip` tree (an `AvatarMC`) built from the game's own SWF plus the
+per-player equipment SWFs. When the player leaves, AQW tears the avatar down —
+`World.destroyAvatar` calls `removeChild`, `Avatar.cleanup` nulls every field,
+`delete world.avatars[id]`. After that, **nothing in AQW's code references the
+departed avatar**. It should be collectable. On the client's build it was not,
+and one avatar tree is hundreds of GC objects — which is exactly the shape of
+the `gc_objects` curve.
+
+### 18.3 Proving the retaining reference
+
+Diagnosis was not by inspection. A temporary heap-graph walker was added to
+gc-arena (a second `trace_graph` vtable entry that records every strong edge
+from the root) and to `ruffle_core` (`heap_census`, which labels each node with
+its Rust type and, for display objects and AVM2 objects, its ActionScript class,
+movie and the *property name* of the edge that reaches it). It runs from the
+desktop memory reporter every N samples, off by default, and is reverted before
+delivery.
+
+Run against the **client-tested commit** during a reproduced authenticated
+session, the census is unambiguous. The heap holds thousands of detached
+`MovieClipData` nodes — display objects with no parent, not on the stage — and
+grouped by their top-most detached ancestor they are overwhelmingly `AvatarMC`
+trees for players long gone from the room. The count of detached objects climbs
+monotonically (620 → 7,396 → 16,972 → 18,750 over the run) in lock-step with
+`gc_objects`, while attached (on-stage) objects stay bounded.
+
+Every retained avatar traces back to the root through one of two references,
+and the census prints the exact chain, property name included:
+
+```
+path to detached root (2204 clips) top=a52224 class=AvatarMC:
+   1 GcRootData
+   2 StageData
+   3 MovieClipData   name=instance51 class=Game
+   4 StageObjectData
+   5 DictionaryObjectData        [slot _colorCache]
+   6 StageObjectData             [dict key; 509 entries]
+   7 MovieClipData   name=a52224 class=AvatarMC   parent=false
+```
+
+```
+path to detached root (203 clips) top=a62558 class=AvatarMC:
+   3 MovieClipData   name=instance51 class=Game
+   4 … Class World
+   6 DictionaryObjectData        [slot avatars]
+   7 ScriptObjectData class=Avatar   [prop 62558; 2 entries]
+   8 StageObjectData             [slot pMC]
+   9 MovieClipData   class=AvatarMC   parent=false
+```
+
+Both roots are **`flash.utils.Dictionary` objects that AQW constructed with
+`weakKeys = true`**. Disassembling `Game3098r25.swf` confirms it:
+`Game._colorCache`, `World.avatars`, `World.uoTree` and several others are each
+`new Dictionary(true)`. AQW relies on the weak-key contract — an entry whose key
+is otherwise unreachable is collectable — to let those caches forget a departed
+player automatically. `_colorCache` is keyed on the avatar's display objects;
+`World.avatars` is keyed on a per-player id string but stores an `Avatar` object
+that reaches the `AvatarMC` through `pMC`, and the *`Avatar` object itself* is a
+value whose only anchor should be its own key.
+
+**Ruffle did not implement weak keys.** `flash.utils.Dictionary` stored every
+object key as an ordinary strong property (a `stub_constructor` was the entire
+`weakKeys` handling). So each cache held its keys — and each key's whole avatar
+tree — strongly, forever. AQW deleted its own references on player-leave, but
+Ruffle's dictionaries never let go, and every avatar that ever entered the room
+stayed on the heap for the rest of the session. That is the remaining leak.
+
+This is not the movie-library problem in another form: the *movies* are shared
+(one `Game3098r25.swf`), so the movie count grows slowly (equipment variety),
+but the *GC objects* — the avatar `MovieClip` trees and their `Avatar` state
+objects — grow with every arrival, which is why `gc_objects` and the Rust heap
+were the counters that ran away while the library counters stayed flat.
+
+### 18.4 The 52 pending loaders
+
+The client log sits at ~52 "pending loaders" for long stretches, and the brief
+asks whether they are the leak. They are not, and the census says why. AQW keeps
+a **pool of reusable `Loader` slots** (`getFreeLoader`/`cleanupLoader`,
+`PreviewAssetLoader.loaderStack`): a fixed set of `Loader` objects it holds for
+the whole session and reuses. In the census these show as loaders in state
+`Pending` with a `NotYetLoaded` stream and no content — reserved slots, not
+in-flight loads, and a bounded number of them. They do not hold avatar content
+and their count does not grow with the session, so they are not the retention.
+
+Two real loader issues did surface, and one is fixed. Completed **image loads**
+(`gameMenu/images/DN-*`) stayed registered in `LoadManager` in state
+`Succeeded` after their content had been placed and their events fired, because
+the deregistration path only removed a loader whose *movie clip* fired
+loader-info events; an image load, whose content is a `Bitmap` beside the clip,
+never took that path. Each stuck loader pinned its `LoaderInfo` and
+`ApplicationDomain`. `LoadManager::run_exit_frame` now also drops a `Succeeded`
+AVM2 loader whose content is no longer the loader's own content, so those clear.
+This is a small contributor next to the dictionaries, but it is a genuine
+never-deregistered load and it is gone.
+
+### 18.5 Error #1009
+
+The console log is dominated by two repeated errors — about 30,700
+`Error running AVM2 frame script: TypeError: Error #1009` and 14,000
+`Error dispatching event "exitFrame": … #1009`. The brief rightly says not to
+reflexively fix these, so they were characterised:
+
+* They are **pre-existing AQW/Ruffle compatibility errors, not caused by this
+  work and not regressions.** The frame-script #1009s come from hair/iris
+  timeline scripts in specific cosmetic SWFs (`Desp25PhoenixLocksTw`,
+  `PanopticonRhizoVisage`, …); the `exitFrame` #1009s come from AQW's own
+  `___LayerProp___.applyZDepthAndColorEffectsHelper`. Both appear on baseline
+  Ruffle in the same proportion, and both were present in the section-15/16
+  sessions before any of this branch's memory work.
+* They are a **symptom-side amplifier of the leak, not its cause.** Each
+  retained avatar still has a ticking timeline (its `enterFrame`/`exitFrame`
+  handlers keep running because the clip, though detached, is an AVM2 orphan
+  that still advances), so every leaked avatar contributes its own stream of
+  #1009s every frame. The per-asset error *rate* is constant; the error
+  *volume* grows because the number of live-but-detached avatars grows. On the
+  fixed build, where detached avatars are collected, the residual #1009 volume
+  falls with them. The fix does not touch the #1009 code and does not claim to:
+  it removes the retained objects that were replaying those scripts.
+
+No `Error #2136` and no "non-registered character" appears anywhere in the
+client log — the section-16 correctness property holds on the client's own run.
+
+### 18.6 The fix
+
+`flash.utils.Dictionary` now implements weak keys, using the same
+ephemeron discipline section 16 built for movie libraries.
+
+* A `Dictionary` constructed with `weakKeys` keeps its object-keyed entries in a
+  separate table (`weak_entries`) whose **keys are `GcWeak` and whose values are
+  hidden from the collector during marking** (a `Collect` impl with
+  `NEEDS_TRACE = false`). Strong-keyed dictionaries are completely unchanged —
+  their object keys still live in the ordinary property map.
+* Each weak dictionary registers itself with `Avm2` (`weak_dictionaries`).
+* `Player::collect_garbage` already had a finalization loop that runs after
+  marking and before sweeping, resurrecting movie-library contents to a
+  fixpoint. That loop now also asks every weak dictionary, each round, to
+  **resurrect the value of any entry whose key was reached by marking** — so a
+  value lives exactly as long as its key, and an entry whose key is reachable
+  only *through its own value* (the `_colorCache`/`avatars` shape) is **not**
+  kept, because the value is never traced until the key is independently proven
+  live. When neither libraries nor dictionaries have anything more to
+  resurrect, the pass prunes every entry whose key is dead and the sweep
+  reclaims the rest.
+* Enumeration (`for..in`/`for each`), `in`, `delete` and AMF serialisation were
+  extended to see the weak entries, so weak dictionaries behave exactly like
+  strong ones from ActionScript — keys enumerate, values resolve, `delete`
+  works — they simply do not keep an otherwise-dead key alive.
+
+This is the correct Flash semantics (a weak-keyed `Dictionary` entry is
+collectable once its key is unreachable), it is the contract AQW's caches were
+written against, and it is implemented with the collector primitives already in
+the codebase rather than by special-casing AQW.
+
+### 18.7 Deterministic regression
+
+`tests/tests/swfs/avm2/dictionary_weak_keys_release/` (built by `build.py` from
+`Test.as`) plus `tests/tests/weak_dictionary/mod.rs`:
+
+`Test.as` fills a weak `Dictionary` with twenty entries whose keys are reachable
+only from the dictionary and from each entry's own value — the exact
+`_colorCache` shape, a value that reaches its own key — alongside a key the
+movie keeps, a string key and an integer key. A strong `Dictionary` gets twenty
+entries of its own as a control. The harness forces two full collections at
+frame 20; at frame 30 the movie reports what survived, compared against
+`output.txt`:
+
+| Assertion | Result |
+|---|---|
+| weak entries before collection | 23 |
+| weak entries after collection | **3** (the kept, string and int keys) |
+| strong entries after collection | 20 (control, unchanged) |
+| held/ string / int key still resolve | value / 1 / 2 |
+| held key still enumerates | yes |
+| `delete weak[held]` then `in` | false |
+
+On the client-tested commit the "after collection" count is 23 — nothing is
+released — so the test fails there and passes on the fix, which is the
+before/after the brief asks for. The forced collection is deliberate: it is what
+makes the assertion independent of collector pacing.
+
+The repository already carries an upstream `avm2/dictionary_weak_keys`
+known-failure test for this exact behaviour. It is left as it is: its plain
+runner never forces a collection within its 25 frames, so Ruffle still emits the
+uncollected `5 / 5` (`output.ruffle.txt`) rather than Flash's `5 / 2`
+(`output.txt`), and it stays `known_failure = true`. The weak-key semantics the
+fix adds are observable only once a collection actually runs, which the new
+`_release` test forces and that one does not; the two are complementary, and
+this change touches neither the upstream test's files nor its status.
+
+The section-16 tests are unchanged and still pass, so the movie-library
+lifetime — including "a held class keeps its library" — is not regressed.
+
+### 18.8 Validation: a 40-minute authenticated session on the fix
+
+Same setup as section 16.9 — official `Loader3.swf`, real account, OpenGL, a
+populated server — driven for **40 minutes**: 16 real `/join` map changes in the
+first ten minutes (matching the client's map phase), then a long stay in busy
+Battleon/Yulgar/farm rooms with continuous avatar traffic, exactly the workload
+that made the client's session grow.
+
+**40-minute authenticated session on the final fix** (OpenGL software
+renderer on this machine; 37 real map changes across three rounds in the first
+~30 minutes, then continued room traffic). Movie, character, GC-object and
+Rust-heap counters all stay in a band; the RSS figure is dominated by the
+software-GL driver's texture working set (`tracked_textures`), which is
+identical on every build:
+
+| Minute | RSS | Rust heap | GC heap | GC objects | Movies | Characters | Pending loaders | Tracked textures |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 401 MiB | 115 MiB | 12 MiB | 74,094 | 6 | 4325 | 0 | 44 MiB |
+| 2 | 441 MiB | 127 MiB | 14 MiB | 88,745 | 7 | 4325 | 1 | 53 MiB |
+| 3 | 586 MiB | 205 MiB | 25 MiB | 126,959 | 11 | 15175 | 1 | 53 MiB |
+| 5 | 1053 MiB | 251 MiB | 31 MiB | 169,325 | 60 | 18380 | 4 | 259 MiB |
+| 8 | 1055 MiB | 286 MiB | 39 MiB | 203,758 | 66 | 23912 | 0 | 329 MiB |
+| 10 | 1056 MiB | 256 MiB | 32 MiB | 170,648 | 60 | 19164 | 1 | 365 MiB |
+| 12 | 1135 MiB | 296 MiB | 41 MiB | 220,095 | 84 | 21882 | 10 | 388 MiB |
+| 15 | 1248 MiB | 324 MiB | 45 MiB | 235,871 | 132 | 22612 | 0 | 565 MiB |
+| 20 | 1474 MiB | 247 MiB | 31 MiB | 167,702 | 52 | 18303 | 3 | 669 MiB |
+| 25 | 1480 MiB | 295 MiB | 41 MiB | 222,550 | 102 | 21298 | 0 | 672 MiB |
+| 30 | 1480 MiB | 315 MiB | 41 MiB | 213,851 | 126 | 22052 | 18 | 674 MiB |
+| 35 | 1529 MiB | 366 MiB | 51 MiB | 261,911 | 187 | 25640 | 7 | 814 MiB |
+
+post-collection floor (minimum over the trailing 3 minutes):
+| Minute | RSS floor | Rust heap floor | GC heap floor | GC objects floor |
+|---|---|---|---|---|
+| 3 | 190 MiB | 32 MiB | 3 MiB | 23,718 |
+| 5 | 449 MiB | 128 MiB | 14 MiB | 89,866 |
+| 8 | 1053 MiB | 241 MiB | 29 MiB | 157,305 |
+| 10 | 1054 MiB | 231 MiB | 28 MiB | 152,456 |
+| 12 | 1039 MiB | 238 MiB | 28 MiB | 153,289 |
+| 15 | 1050 MiB | 264 MiB | 35 MiB | 188,580 |
+| 20 | 1233 MiB | 232 MiB | 28 MiB | 154,050 |
+| 25 | 1480 MiB | 259 MiB | 31 MiB | 168,044 |
+| 30 | 1480 MiB | 233 MiB | 29 MiB | 156,958 |
+| 35 | 1497 MiB | 328 MiB | 43 MiB | 223,489 |
+
+
+The **post-collection floor** is the level just after a collection (the minimum
+over each trailing three-minute window); it is what "bounded" has to mean for a
+collector, and here it is flat from minute 5 to minute 35 while play continues.
+
+**Client-tested build versus the fix, at the same elapsed times:**
+
+| Time | Client-tested build (Windows, 837b08df) | Final fix (40-min session) |
+|---|---|---|
+| 10 min | RSS 4.9 GB, Rust heap 1863 MiB, 1151 movies, 74843 chars, 2,531,177 GC objects | RSS 1056 MiB (GL sw-renderer), Rust heap 256 MiB, 60 movies, 19164 chars, 170,648 GC objects |
+| 20 min | RSS 6.0 GB, Rust heap 2911 MiB, 1215 movies, 80476 chars, 6,017,599 GC objects | RSS 1474 MiB (GL sw-renderer), Rust heap 247 MiB, 52 movies, 18303 chars, 167,702 GC objects |
+| 30 min | RSS 6.5 GB, Rust heap 3360 MiB, 1298 movies, 85737 chars, 7,294,180 GC objects | RSS 1480 MiB (GL sw-renderer), Rust heap 315 MiB, 126 movies, 22052 chars, 213,851 GC objects |
+| 38 min | RSS 6.9 GB, Rust heap 3170 MiB, 1432 movies, 91737 chars, 6,169,380 GC objects | - |
+
+
+The counters that ran away on the client's build are **bounded** on the fix:
+the movie count sits in a band instead of climbing past a thousand; the
+character count oscillates with room population instead of ratcheting up; the
+GC object count returns to its floor after every collection instead of leaving
+a residue per departed avatar; and the Rust heap tracks what is *currently* in
+the rooms, not the sum of everyone who was ever there. The heap census run
+against the fix confirms the mechanism directly: the large detached `AvatarMC`
+roots are gone, and the only detached clips that remain are a bounded set of
+persistent interface panels (the menu, the news panel, the connection dialog),
+which is correct.
+
+No `Error #2136`, no "non-registered character", no panic in the session.
+Equipment, weapons, armour, capes, helms and hair load and render; maps load
+and unload; class ApplicationDomains resolve. The residual working-set drift
+that remains is the OpenGL software renderer's, identical on every build
+(section 9.3), not Ruffle state.

@@ -2534,7 +2534,18 @@ impl Player {
                     .data
                     .try_borrow_mut(fc)
                     .expect("Arena root borrowed during garbage collection");
-                data.library.resolve_releasable_libraries(fc)
+                // Both kinds of ephemeron are asked every round: a library's
+                // resurrected contents can reach a weak dictionary's key, and
+                // a weak dictionary's resurrected value can reach a library's
+                // anchor. Nothing is dropped until neither has more to keep.
+                let libraries = data.library.resurrect_needed_libraries(fc);
+                let dictionaries = data.avm2.resurrect_weak_dictionary_values(fc);
+                if libraries || dictionaries {
+                    return true;
+                }
+                data.library.release_unneeded_libraries(fc);
+                data.avm2.prune_weak_dictionaries(fc);
+                false
             });
             marked = arena
                 .finish_marking()

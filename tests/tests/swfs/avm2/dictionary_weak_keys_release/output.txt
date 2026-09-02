@@ -1,0 +1,11 @@
+weak entries before collection: 23
+strong entries before collection: 20
+held in weak: true
+weak entries after collection: 3
+strong entries after collection: 20
+held value: value of held
+string key: 1
+int key: 2
+held enumerated: 1
+held in weak after delete: false
+weak entries after delete: 2

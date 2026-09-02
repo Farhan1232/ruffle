@@ -497,11 +497,36 @@ impl<'gc> LoadManager<'gc> {
         }
         let handles: Vec<_> = context.load_manager.0.iter().map(|(h, _)| h).collect();
         for handle in handles {
-            if let Some(MovieLoader { target_clip, .. }) = context.load_manager.get_loader(handle)
-                && let Some(movie) = target_clip.as_movie_clip()
+            let Some(MovieLoader {
+                target_clip,
+                vm_data,
+                loader_status,
+                ..
+            }) = context.load_manager.get_loader(handle)
+            else {
+                continue;
+            };
+            let (target_clip, vm_data, loader_status) = (*target_clip, *vm_data, *loader_status);
+
+            if let Some(movie) = target_clip.as_movie_clip()
                 && movie.try_fire_loaderinfo_events(context)
             {
-                context.load_manager.remove_loader(handle)
+                context.load_manager.remove_loader(handle);
+                continue;
+            }
+
+            // A finished load whose target clip is not the loaded content
+            // has no more events to fire from that clip: the content was an
+            // image, which is placed as a `Bitmap` beside the clip, or the
+            // loader was unloaded before its `complete` event could be sent.
+            // Such a loader would otherwise stay registered - and keep the
+            // content, its `LoaderInfo` and its `ApplicationDomain` rooted -
+            // for the rest of the session.
+            if loader_status == LoaderStatus::Succeeded
+                && let MovieLoaderVMData::Avm2 { loader_info, .. } = vm_data
+                && !loader_info.content_is(target_clip)
+            {
+                context.load_manager.remove_loader(handle);
             }
         }
     }

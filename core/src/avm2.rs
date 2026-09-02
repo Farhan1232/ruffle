@@ -27,7 +27,7 @@ use crate::{PlayerMode, PlayerRuntime};
 
 use fnv::FnvHashMap;
 use gc_arena::lock::GcRefLock;
-use gc_arena::{Collect, Gc, Mutation};
+use gc_arena::{Collect, Finalization, Gc, Mutation};
 use ruffle_wstr::WStr;
 use std::sync::Arc;
 use swf::DoAbc2Flag;
@@ -97,8 +97,9 @@ pub use crate::avm2::globals::flash::ui::context_menu::make_context_menu_state;
 pub use crate::avm2::multiname::Multiname;
 pub use crate::avm2::namespace::{CommonNamespaces, Namespace};
 pub use crate::avm2::object::{
-    ArrayObject, BitmapDataObject, ClassObject, EventObject, LoaderInfoObject, Object,
-    SharedObjectObject, SoundChannelObject, Stage3DObject, StageObject, TObject,
+    ArrayObject, BitmapDataObject, ClassObject, DictionaryObject, DictionaryObjectWeak,
+    EventObject, LoaderInfoObject, Object, SharedObjectObject, SoundChannelObject, Stage3DObject,
+    StageObject, TObject,
 };
 pub use crate::avm2::qname::QName;
 pub use crate::avm2::value::Value;
@@ -172,6 +173,12 @@ pub struct Avm2<'gc> {
     /// currently present on the display list. This list keeps track of that.
     broadcast_list: FnvHashMap<AvmString<'gc>, Vec<WeakObject<'gc>>>,
 
+    /// Every `Dictionary` constructed with `weakKeys` that has not been
+    /// collected. Held weakly; consulted by the collector's finalization
+    /// pass, which decides entry by entry whether a value survives the
+    /// cycle. See [`DictionaryObject::resurrect_live_entries`].
+    weak_dictionaries: Vec<DictionaryObjectWeak<'gc>>,
+
     alias_to_class_map: FnvHashMap<AvmString<'gc>, ClassObject<'gc>>,
     class_to_alias_map: FnvHashMap<Class<'gc>, AvmString<'gc>>,
 
@@ -228,6 +235,7 @@ impl<'gc> Avm2<'gc> {
             native_custom_constructor_table: Default::default(),
             native_fast_call_list: Default::default(),
             broadcast_list: Default::default(),
+            weak_dictionaries: Vec::new(),
 
             alias_to_class_map: Default::default(),
             class_to_alias_map: Default::default(),
@@ -385,6 +393,48 @@ impl<'gc> Avm2<'gc> {
     ///
     /// Attempts to register the same listener for the same event will also do
     /// nothing.
+    /// Records a dictionary that holds its object keys weakly, so that the
+    /// finalization pass can find it. See [`Self::weak_dictionaries`].
+    pub fn register_weak_dictionary(&mut self, dictionary: DictionaryObjectWeak<'gc>) {
+        self.weak_dictionaries.push(dictionary);
+    }
+
+    /// The finalization step for weak-keyed dictionaries: brings back the
+    /// value of every entry whose key is still reachable. Returns whether
+    /// anything was resurrected, in which case marking has to resume and this
+    /// has to be asked again, until nothing more comes back.
+    ///
+    /// Only meaningful between the end of marking and the start of sweeping.
+    pub fn resurrect_weak_dictionary_values(&self, fc: &Finalization<'gc>) -> bool {
+        let mut resurrected = false;
+        for dictionary in &self.weak_dictionaries {
+            if dictionary.0.is_dead(fc) {
+                continue;
+            }
+            if let Some(dictionary) = dictionary.0.upgrade(fc)
+                && DictionaryObject(dictionary).resurrect_live_entries(fc)
+            {
+                resurrected = true;
+            }
+        }
+        resurrected
+    }
+
+    /// The last finalization step, once nothing more can be resurrected:
+    /// drops the entries whose keys died this cycle and forgets the
+    /// dictionaries that died themselves.
+    pub fn prune_weak_dictionaries(&mut self, fc: &Finalization<'gc>) {
+        self.weak_dictionaries.retain(|dictionary| {
+            if dictionary.0.is_dead(fc) {
+                return false;
+            }
+            if let Some(dictionary) = dictionary.0.upgrade(fc) {
+                DictionaryObject(dictionary).prune_dead_entries(fc);
+            }
+            true
+        });
+    }
+
     pub fn register_broadcast_listener(
         context: &mut UpdateContext<'gc>,
         object: Object<'gc>,

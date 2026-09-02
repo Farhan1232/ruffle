@@ -1,0 +1,4 @@
+num_frames = 40
+# Run by tests/weak_dictionary/mod.rs, which forces the collections the
+# output depends on; the plain runner cannot make those happen on cue.
+ignore = true
