@@ -78,6 +78,9 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     viewport_scale_factor: f64,
     texture_pool: TexturePool,
     offscreen_texture_pool: TexturePool,
+    /// Frames drawn since the surface pool was last given the chance to
+    /// release targets it no longer needs.
+    frames_since_pool_trim: u32,
     pub(crate) offscreen_buffer_pool: Arc<BufferPool<wgpu::Buffer, BufferDimensions>>,
     dynamic_transforms: DynamicTransforms,
     active_frame: ActiveFrame,
@@ -215,6 +218,12 @@ impl WgpuRenderBackend<crate::target::TextureTarget> {
     }
 }
 
+/// How often the surface pool is offered the chance to release idle targets.
+/// Roughly two seconds of play: long enough that a scene alternating between
+/// shapes never loses the targets it is cycling through, short enough that a
+/// crowd which has left gives its memory back during the same session.
+const FRAMES_BETWEEN_POOL_TRIMS: u32 = 60;
+
 impl<T: RenderTarget> WgpuRenderBackend<T> {
     pub fn new(descriptors: Arc<Descriptors>, target: T) -> Result<Self, Error> {
         if target.width() > descriptors.limits.max_texture_dimension_2d
@@ -275,6 +284,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             viewport_scale_factor: 1.0,
             texture_pool: TexturePool::new(),
             offscreen_texture_pool: TexturePool::new(),
+            frames_since_pool_trim: 0,
             offscreen_buffer_pool: Arc::new(offscreen_buffer_pool),
             dynamic_transforms: transforms,
             active_frame,
@@ -685,6 +695,17 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         self.active_frame
             .submit_for_target(&self.descriptors, &self.target, frame_output);
         self.offscreen_texture_pool = TexturePool::new();
+
+        // The offscreen pool above is rebuilt every frame, but the surface
+        // pool lives for the whole session, so it grows to the busiest frame
+        // it has ever drawn and stays there. Give it the chance to let go of
+        // targets it has stopped needing - rarely, because the point is to
+        // keep re-using them, not to churn.
+        self.frames_since_pool_trim += 1;
+        if self.frames_since_pool_trim >= FRAMES_BETWEEN_POOL_TRIMS {
+            self.frames_since_pool_trim = 0;
+            self.texture_pool.trim_idle();
+        }
     }
 
     #[instrument(level = "debug", skip_all)]
