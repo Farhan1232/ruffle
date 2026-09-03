@@ -11,30 +11,53 @@ type Constructor<Type, Description> = Box<dyn Fn(&Descriptors, &Description) -> 
 /// A pooled render target. Accounted for in the memory report like any other
 /// texture Ruffle creates; see `tracked_texture_totals`.
 #[derive(Debug)]
-pub struct PooledTexture(pub wgpu::Texture, pub wgpu::TextureView);
+pub struct PooledTexture(
+    pub wgpu::Texture,
+    pub wgpu::TextureView,
+    pub(crate) crate::TextureKind,
+);
 
 impl PooledTexture {
-    fn new(texture: wgpu::Texture, view: wgpu::TextureView) -> Self {
-        crate::track_texture_created(&texture);
-        Self(texture, view)
+    fn new(texture: wgpu::Texture, view: wgpu::TextureView, kind: crate::TextureKind) -> Self {
+        crate::track_texture_created(&texture, kind);
+        Self(texture, view, kind)
     }
 }
 
 impl Drop for PooledTexture {
     fn drop(&mut self) {
-        crate::track_texture_dropped(&self.0);
+        crate::track_texture_dropped(&self.0, self.2);
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TexturePool {
     pools: FnvHashMap<TextureKey, BufferPool<PooledTexture, AlwaysCompatible>>,
     globals_cache: FnvHashMap<GlobalsKey, Arc<Globals>>,
+    /// Which pool this is, so the memory report can tell the surface pool
+    /// (which lives across frames) from the offscreen one (which the renderer
+    /// replaces every frame). Reporting only; it changes nothing.
+    kind: crate::TextureKind,
+}
+
+/// One size class held by a [`TexturePool`], for the memory report.
+#[derive(Clone, Copy, Debug)]
+pub struct PoolSizeClass {
+    pub width: u32,
+    pub height: u32,
+    pub sample_count: u32,
+    /// Entries sitting unused in this size's free list.
+    pub idle_entries: usize,
+    pub idle_bytes: usize,
 }
 
 impl TexturePool {
-    pub fn new() -> Self {
-        Default::default()
+    pub fn new(kind: crate::TextureKind) -> Self {
+        Self {
+            pools: Default::default(),
+            globals_cache: Default::default(),
+            kind,
+        }
     }
 
     pub fn get_texture(
@@ -51,6 +74,7 @@ impl TexturePool {
             format,
             sample_count,
         };
+        let kind = self.kind;
         let pool = self.pools.entry(key).or_insert_with(|| {
             let label = if cfg!(feature = "render_debug_labels") {
                 use std::sync::atomic::{AtomicU32, Ordering};
@@ -72,10 +96,55 @@ impl TexturePool {
                     usage,
                 });
                 let view = texture.create_view(&Default::default());
-                PooledTexture::new(texture, view)
+                PooledTexture::new(texture, view, kind)
             }))
         });
         pool.take(descriptors, AlwaysCompatible)
+    }
+
+    /// `(distinct sizes pooled, textures idle in free lists, their bytes)`.
+    ///
+    /// A texture is idle when nothing is currently borrowing it: it has been
+    /// returned to its pool and is being kept for reuse. This is what the
+    /// pool retains between frames, as opposed to what a frame is using, and
+    /// so is the number that says whether a high working set is the
+    /// renderer's pooling rather than live content.
+    pub fn idle_totals(&self) -> (usize, usize, usize) {
+        let mut textures = 0;
+        let mut bytes = 0;
+        for pool in self.pools.values() {
+            for (texture, _) in pool.available().iter() {
+                textures += 1;
+                bytes += crate::texture_bytes(&texture.0);
+            }
+        }
+        (self.pools.len(), textures, bytes)
+    }
+
+    /// Every size class this pool holds, heaviest first. Lets the report name
+    /// the sizes that are actually retaining memory rather than only totalling
+    /// them.
+    pub fn size_classes(&self) -> Vec<PoolSizeClass> {
+        let mut classes: Vec<_> = self
+            .pools
+            .iter()
+            .map(|(key, pool)| {
+                let available = pool.available();
+                let idle_bytes = available
+                    .iter()
+                    .map(|(texture, _)| crate::texture_bytes(&texture.0))
+                    .sum();
+                PoolSizeClass {
+                    width: key.size.width,
+                    height: key.size.height,
+                    sample_count: key.sample_count,
+                    idle_entries: available.len(),
+                    idle_bytes,
+                }
+            })
+            .collect();
+        classes.sort_by(|a, b| b.idle_bytes.cmp(&a.idle_bytes));
+        classes
     }
 
     pub fn get_globals(
@@ -157,15 +226,31 @@ impl<Type, Description: BufferDescription> BufferPool<Type, Description> {
         }
     }
 
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<(Type, Description)>> {
+        self.available
+            .lock()
+            .expect("Should not be able to lock recursively")
+    }
+
+    /// The entries sitting unused in this pool, kept for reuse.
+    pub(crate) fn available(&self) -> std::sync::MutexGuard<'_, Vec<(Type, Description)>> {
+        self.lock()
+    }
+
+    /// How many entries are idle in this pool, and the bytes they describe.
+    /// `size_of` maps a description to its byte size, since only the caller
+    /// knows how its descriptions are measured.
+    pub fn idle_totals(&self, size_of: impl Fn(&Description) -> usize) -> (usize, usize) {
+        let guard = self.lock();
+        (guard.len(), guard.iter().map(|(_, d)| size_of(d)).sum())
+    }
+
     pub fn take(
         &self,
         descriptors: &Descriptors,
         description: Description,
     ) -> PoolEntry<Type, Description> {
-        let mut guard = self
-            .available
-            .lock()
-            .expect("Should not be able to lock recursively");
+        let mut guard = self.lock();
         let mut best: Option<(Description::Cost, usize)> = None;
         for i in 0..guard.len() {
             if let Some(cost) = description.cost_to_use(&guard[i].1) {
@@ -180,8 +265,10 @@ impl<Type, Description: BufferDescription> BufferPool<Type, Description> {
         }
 
         let (item, used_description) = if let Some((_, best)) = best {
+            crate::texture_stats_record_pool_reuse();
             guard.swap_remove(best)
         } else {
+            crate::texture_stats_record_pool_miss();
             let item = (self.constructor)(descriptors, &description);
             (item, description)
         };

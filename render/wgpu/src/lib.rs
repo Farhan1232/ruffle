@@ -270,6 +270,8 @@ impl QueueSyncHandle {
 #[derive(Debug)]
 pub struct Texture {
     pub(crate) texture: wgpu::Texture,
+    /// What this texture is for, for the memory report only.
+    kind: TextureKind,
     repeating_linear: OnceCell<BitmapBinds>,
     repeating_nearest: OnceCell<BitmapBinds>,
     clamped_linear: OnceCell<BitmapBinds>,
@@ -277,12 +279,146 @@ pub struct Texture {
     copy_count: Cell<u8>,
 }
 
-/// Bytes of texture memory Ruffle itself has asked for and not yet released
-/// - bitmap textures, cached display objects, pooled render targets - and
-/// how many such textures there are. Not every backend can report texture
-/// memory, so this is counted here for the memory report.
-static TEXTURE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static TEXTURE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Measurement-only accounting of every texture Ruffle asks the GPU for.
+///
+/// The point of splitting this by [`TextureKind`] is that the kinds have very
+/// different lifetimes, and the question this build exists to answer is which
+/// of them the process is still holding when the working set stays high:
+///
+/// * `Bitmap` and `CacheAsBitmap` are owned by content, and fall when the
+///   content does. Memory retained here would be a live leak.
+/// * `PoolMain` and `PoolOffscreen` are scratch render targets. Memory
+///   retained here is the renderer's own pooling, not content.
+/// * `Temporary` is a one-off render output that should never accumulate.
+///
+/// None of these counters change what is allocated, when it is freed, or how
+/// long anything lives; they only observe.
+mod texture_stats {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    /// What a tracked texture is for.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum TextureKind {
+        /// A decoded image registered by the player: owned by a movie library.
+        Bitmap = 0,
+        /// The backing store of a `cacheAsBitmap` or filtered display object.
+        CacheAsBitmap = 1,
+        /// A one-off render output, such as a Pixel Bender result.
+        Temporary = 2,
+        /// A render target from the surface pool, which lives across frames.
+        PoolMain = 3,
+        /// A render target from the offscreen pool, which the renderer
+        /// replaces every frame.
+        PoolOffscreen = 4,
+    }
+
+    pub(crate) const KINDS: usize = 5;
+
+    pub(crate) const KIND_NAMES: [&str; KINDS] = [
+        "bitmap",
+        "cache_as_bitmap",
+        "temporary",
+        "pool_main",
+        "pool_offscreen",
+    ];
+
+    static LIVE_COUNT: [AtomicUsize; KINDS] = [const { AtomicUsize::new(0) }; KINDS];
+    static LIVE_BYTES: [AtomicUsize; KINDS] = [const { AtomicUsize::new(0) }; KINDS];
+    static CREATED_COUNT: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+    static CREATED_BYTES: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+    static DROPPED_COUNT: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+    static DROPPED_BYTES: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+
+    /// The most texture memory Ruffle has held at once, over the whole run.
+    /// Compared against the process' working set, this is what separates a
+    /// high-water mark from memory that is still live.
+    static PEAK_LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+    /// Times a pool handed back an existing target instead of building one.
+    static POOL_REUSES: AtomicU64 = AtomicU64::new(0);
+    /// Times a pool had nothing to hand back and constructed a new target.
+    static POOL_MISSES: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn record_created(kind: TextureKind, bytes: usize) {
+        let i = kind as usize;
+        LIVE_BYTES[i].fetch_add(bytes, Ordering::Relaxed);
+        LIVE_COUNT[i].fetch_add(1, Ordering::Relaxed);
+        CREATED_BYTES[i].fetch_add(bytes as u64, Ordering::Relaxed);
+        CREATED_COUNT[i].fetch_add(1, Ordering::Relaxed);
+
+        let live: usize = LIVE_BYTES.iter().map(|b| b.load(Ordering::Relaxed)).sum();
+        PEAK_LIVE_BYTES.fetch_max(live, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_dropped(kind: TextureKind, bytes: usize) {
+        let i = kind as usize;
+        LIVE_BYTES[i].fetch_sub(bytes, Ordering::Relaxed);
+        LIVE_COUNT[i].fetch_sub(1, Ordering::Relaxed);
+        DROPPED_BYTES[i].fetch_add(bytes as u64, Ordering::Relaxed);
+        DROPPED_COUNT[i].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_pool_reuse() {
+        POOL_REUSES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_pool_miss() {
+        POOL_MISSES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A snapshot of the texture counters, per kind and in total.
+    #[derive(Clone, Debug, Default)]
+    pub struct TextureStats {
+        pub live_count: [usize; KINDS],
+        pub live_bytes: [usize; KINDS],
+        pub created_count: [u64; KINDS],
+        pub created_bytes: [u64; KINDS],
+        pub dropped_count: [u64; KINDS],
+        pub dropped_bytes: [u64; KINDS],
+        pub peak_live_bytes: usize,
+        pub pool_reuses: u64,
+        pub pool_misses: u64,
+    }
+
+    impl TextureStats {
+        pub fn total_live_bytes(&self) -> usize {
+            self.live_bytes.iter().sum()
+        }
+
+        pub fn total_live_count(&self) -> usize {
+            self.live_count.iter().sum()
+        }
+    }
+
+    pub fn texture_stats() -> TextureStats {
+        let load_usize =
+            |a: &[AtomicUsize; KINDS]| std::array::from_fn(|i| a[i].load(Ordering::Relaxed));
+        let load_u64 =
+            |a: &[AtomicU64; KINDS]| std::array::from_fn(|i| a[i].load(Ordering::Relaxed));
+        TextureStats {
+            live_count: load_usize(&LIVE_COUNT),
+            live_bytes: load_usize(&LIVE_BYTES),
+            created_count: load_u64(&CREATED_COUNT),
+            created_bytes: load_u64(&CREATED_BYTES),
+            dropped_count: load_u64(&DROPPED_COUNT),
+            dropped_bytes: load_u64(&DROPPED_BYTES),
+            peak_live_bytes: PEAK_LIVE_BYTES.load(Ordering::Relaxed),
+            pool_reuses: POOL_REUSES.load(Ordering::Relaxed),
+            pool_misses: POOL_MISSES.load(Ordering::Relaxed),
+        }
+    }
+}
+
+pub(crate) use texture_stats::{KIND_NAMES, TextureKind};
+pub use texture_stats::{TextureStats, texture_stats};
+
+pub(crate) fn texture_stats_record_pool_reuse() {
+    texture_stats::record_pool_reuse();
+}
+
+pub(crate) fn texture_stats_record_pool_miss() {
+    texture_stats::record_pool_miss();
+}
 
 /// Approximate memory of a texture: its pixels at the format's block size.
 pub(crate) fn texture_bytes(texture: &wgpu::Texture) -> usize {
@@ -294,38 +430,32 @@ pub(crate) fn texture_bytes(texture: &wgpu::Texture) -> usize {
         * bytes_per_block
 }
 
-pub(crate) fn track_texture_created(texture: &wgpu::Texture) {
-    use std::sync::atomic::Ordering;
-    TEXTURE_BYTES.fetch_add(texture_bytes(texture), Ordering::Relaxed);
-    TEXTURE_COUNT.fetch_add(1, Ordering::Relaxed);
+pub(crate) fn track_texture_created(texture: &wgpu::Texture, kind: TextureKind) {
+    texture_stats::record_created(kind, texture_bytes(texture));
 }
 
-pub(crate) fn track_texture_dropped(texture: &wgpu::Texture) {
-    use std::sync::atomic::Ordering;
-    TEXTURE_BYTES.fetch_sub(texture_bytes(texture), Ordering::Relaxed);
-    TEXTURE_COUNT.fetch_sub(1, Ordering::Relaxed);
+pub(crate) fn track_texture_dropped(texture: &wgpu::Texture, kind: TextureKind) {
+    texture_stats::record_dropped(kind, texture_bytes(texture));
 }
 
 /// `(textures alive, their bytes)` as tracked by Ruffle.
 pub fn tracked_texture_totals() -> (usize, usize) {
-    use std::sync::atomic::Ordering;
-    (
-        TEXTURE_COUNT.load(Ordering::Relaxed),
-        TEXTURE_BYTES.load(Ordering::Relaxed),
-    )
+    let stats = texture_stats();
+    (stats.total_live_count(), stats.total_live_bytes())
 }
 
 impl Drop for Texture {
     fn drop(&mut self) {
-        track_texture_dropped(&self.texture);
+        track_texture_dropped(&self.texture, self.kind);
     }
 }
 
 impl Texture {
-    pub(crate) fn new(texture: wgpu::Texture) -> Self {
-        track_texture_created(&texture);
+    pub(crate) fn new(texture: wgpu::Texture, kind: TextureKind) -> Self {
+        track_texture_created(&texture, kind);
         Self {
             texture,
+            kind,
             repeating_linear: Default::default(),
             repeating_nearest: Default::default(),
             clamped_linear: Default::default(),

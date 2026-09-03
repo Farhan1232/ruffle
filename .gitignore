@@ -19,3 +19,12 @@ RECOVER_*.fla
 
 # A developers local Flash Player harness config
 .flash_players.toml
+
+# AQW diagnostic output - may contain the tester's login traffic, never commit
+aqw-diagnostic/
+diagnostic-*.csv
+diagnostic-*.log
+diagnostic-*.txt
+*-memory.csv
+*-windows-ram.csv
+*-console.log

@@ -15,6 +15,10 @@ use std::fmt::Write as _;
 
 use crate::context::UpdateContext;
 
+/// Identifies this instrumentation, so a log can be tied to the build that
+/// produced it. Bump it whenever the columns change.
+pub const INSTRUMENTATION_VERSION: &str = "aqw-gpu-diag-1";
+
 /// What a single still-resident movie is keeping alive.
 #[derive(Debug, Clone)]
 pub struct MovieMemory {
@@ -89,6 +93,42 @@ pub struct MemoryReport {
     /// bytes; counted by Ruffle, so available on every backend.
     pub tracked_textures: usize,
     pub tracked_texture_bytes: usize,
+    /// Live textures split by what they are for - decoded bitmaps,
+    /// `cacheAsBitmap` backing stores, one-off render outputs, and render
+    /// targets from each pool - so that memory owned by live content can be
+    /// told apart from memory the renderer holds as reusable scratch.
+    pub texture_kind_names: &'static [&'static str],
+    pub texture_kind_live_counts: Vec<usize>,
+    pub texture_kind_live_bytes: Vec<usize>,
+    pub texture_kind_created: Vec<u64>,
+    pub texture_kind_created_bytes: Vec<u64>,
+    pub texture_kind_dropped: Vec<u64>,
+    pub texture_kind_dropped_bytes: Vec<u64>,
+    /// The most texture memory held at once over the whole run.
+    pub peak_texture_bytes: usize,
+    /// Pool free-list hits versus misses, which is how much the renderer is
+    /// actually re-using its render targets.
+    pub pool_reuses: u64,
+    pub pool_misses: u64,
+    /// Idle render targets in the surface pool (kept across frames) and the
+    /// offscreen pool (replaced each frame), with their size-class counts.
+    pub main_pool_idle_textures: usize,
+    pub main_pool_idle_bytes: usize,
+    pub main_pool_size_classes: usize,
+    pub offscreen_pool_idle_textures: usize,
+    pub offscreen_pool_idle_bytes: usize,
+    pub offscreen_pool_size_classes: usize,
+    /// Readback/upload buffers idle in the renderer's buffer pool.
+    pub buffer_pool_idle_entries: usize,
+    pub buffer_pool_idle_bytes: usize,
+    /// The heaviest retained pool size classes, for the log.
+    pub heaviest_pool_classes: Vec<(u32, u32, u32, usize, usize)>,
+    /// Textures created and dropped since start; differences between samples
+    /// give the renderer's texture allocation churn.
+    pub textures_created: u64,
+    pub texture_bytes_created: u64,
+    pub textures_dropped: u64,
+    pub texture_bytes_dropped: u64,
 }
 
 impl MemoryReport {
@@ -110,6 +150,29 @@ impl MemoryReport {
             report.mesh_bytes = gpu.mesh_bytes;
             report.tracked_textures = gpu.tracked_textures;
             report.tracked_texture_bytes = gpu.tracked_texture_bytes;
+            report.texture_kind_names = gpu.texture_kind_names;
+            report.texture_kind_live_counts = gpu.texture_kind_live_counts;
+            report.texture_kind_live_bytes = gpu.texture_kind_live_bytes;
+            report.texture_kind_created = gpu.texture_kind_created;
+            report.texture_kind_created_bytes = gpu.texture_kind_created_bytes;
+            report.texture_kind_dropped = gpu.texture_kind_dropped;
+            report.texture_kind_dropped_bytes = gpu.texture_kind_dropped_bytes;
+            report.peak_texture_bytes = gpu.peak_texture_bytes;
+            report.pool_reuses = gpu.pool_reuses;
+            report.pool_misses = gpu.pool_misses;
+            report.main_pool_idle_textures = gpu.main_pool_idle_textures;
+            report.main_pool_idle_bytes = gpu.main_pool_idle_bytes;
+            report.main_pool_size_classes = gpu.main_pool_size_classes;
+            report.offscreen_pool_idle_textures = gpu.offscreen_pool_idle_textures;
+            report.offscreen_pool_idle_bytes = gpu.offscreen_pool_idle_bytes;
+            report.offscreen_pool_size_classes = gpu.offscreen_pool_size_classes;
+            report.buffer_pool_idle_entries = gpu.buffer_pool_idle_entries;
+            report.buffer_pool_idle_bytes = gpu.buffer_pool_idle_bytes;
+            report.heaviest_pool_classes = gpu.heaviest_pool_classes;
+            report.textures_created = gpu.textures_created;
+            report.texture_bytes_created = gpu.texture_bytes_created;
+            report.textures_dropped = gpu.textures_dropped;
+            report.texture_bytes_dropped = gpu.texture_bytes_dropped;
         }
 
         let movies: Vec<_> = context.library.known_movies().collect();
@@ -150,14 +213,50 @@ impl MemoryReport {
         report
     }
 
-    /// One CSV row, for logging a time series across a zone-change run.
-    pub fn csv_header() -> &'static str {
-        "elapsed_s,movies,characters,swf_bytes,bitmap_source_bytes,bitmap_decoded_bytes,pending_loaders,class_aliases,gc_allocation,gc_objects,gc_external_bytes,gpu_textures,gpu_texture_bytes,gpu_buffer_bytes,meshes,mesh_bytes,tracked_textures,tracked_texture_bytes"
+    /// The texture kinds this build reports, in the order their columns
+    /// appear. Taken from the renderer so the header cannot drift from the
+    /// rows; empty until the first sample, when the backend names them.
+    pub fn texture_kind_names(&self) -> &'static [&'static str] {
+        self.texture_kind_names
     }
 
+    /// The CSV header for a report, including one group of columns per
+    /// texture kind. `kinds` must be the same names the rows will use.
+    pub fn csv_header_for(kinds: &[&str]) -> String {
+        let mut header = String::from(
+            "elapsed_s,movies,characters,swf_bytes,bitmap_source_bytes,bitmap_decoded_bytes,\
+             pending_loaders,class_aliases,gc_allocation,gc_objects,gc_external_bytes,\
+             gpu_textures,gpu_texture_bytes,gpu_buffer_bytes,meshes,mesh_bytes,\
+             tracked_textures,tracked_texture_bytes,peak_texture_bytes,pool_reuses,pool_misses,\
+             main_pool_idle_textures,main_pool_idle_bytes,main_pool_size_classes,\
+             offscreen_pool_idle_textures,offscreen_pool_idle_bytes,offscreen_pool_size_classes,\
+             buffer_pool_idle_entries,buffer_pool_idle_bytes,\
+             textures_created,texture_bytes_created,textures_dropped,texture_bytes_dropped",
+        );
+        for kind in kinds {
+            for suffix in [
+                "live",
+                "live_bytes",
+                "created",
+                "created_bytes",
+                "dropped",
+                "dropped_bytes",
+            ] {
+                let _ = write!(header, ",tex_{kind}_{suffix}");
+            }
+        }
+        header
+    }
+
+    /// The header for a report whose renderer could not name its kinds.
+    pub fn csv_header() -> String {
+        Self::csv_header_for(&[])
+    }
+
+    /// One CSV row, for logging a time series across a zone-change run.
     pub fn to_csv_row(&self, elapsed_s: f64) -> String {
-        format!(
-            "{:.1},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        let mut row = format!(
+            "{:.1},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             elapsed_s,
             self.movies.len(),
             self.characters,
@@ -176,7 +275,50 @@ impl MemoryReport {
             self.mesh_bytes,
             self.tracked_textures,
             self.tracked_texture_bytes,
-        )
+            self.peak_texture_bytes,
+            self.pool_reuses,
+            self.pool_misses,
+            self.main_pool_idle_textures,
+            self.main_pool_idle_bytes,
+            self.main_pool_size_classes,
+            self.offscreen_pool_idle_textures,
+            self.offscreen_pool_idle_bytes,
+            self.offscreen_pool_size_classes,
+            self.buffer_pool_idle_entries,
+            self.buffer_pool_idle_bytes,
+            self.textures_created,
+            self.texture_bytes_created,
+            self.textures_dropped,
+            self.texture_bytes_dropped,
+        );
+        for i in 0..self.texture_kind_names.len() {
+            let at = |v: &Vec<usize>| v.get(i).copied().unwrap_or(0);
+            let at64 = |v: &Vec<u64>| v.get(i).copied().unwrap_or(0);
+            let _ = write!(
+                row,
+                ",{},{},{},{},{},{}",
+                at(&self.texture_kind_live_counts),
+                at(&self.texture_kind_live_bytes),
+                at64(&self.texture_kind_created),
+                at64(&self.texture_kind_created_bytes),
+                at64(&self.texture_kind_dropped),
+                at64(&self.texture_kind_dropped_bytes),
+            );
+        }
+        row
+    }
+
+    /// The retained pool size classes, for a human reading the log.
+    pub fn top_pool_classes(&self) -> String {
+        let mut out = String::new();
+        for (width, height, samples, entries, bytes) in self.heaviest_pool_classes.iter().take(6) {
+            let _ = write!(
+                out,
+                "\n    {width:>5} x {height:<5} x{samples}  {entries:>4} idle  {:>8} KiB",
+                bytes / 1024,
+            );
+        }
+        out
     }
 
     /// The heaviest movies still resident, for a human reading the log.
