@@ -20,7 +20,9 @@ repo         : https://github.com/Farhan1232/ruffle.git
 branch       : $branch
 commit       : $commit
 worktree     : $dirty
-instrument   : aqw-gpu-diag-1
+instrument   : aqw-gpu-diag-2-pooltrim
+fix commit   : 140979e2948473d320dc2abc97974f8ccb52d836
+fix parent   : 25401e81e3f736fc8efb67ce76c14cce6a2bce2e
 exe path     : $($item.FullName)
 exe modified : $($item.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'))
 exe size     : $($item.Length) bytes

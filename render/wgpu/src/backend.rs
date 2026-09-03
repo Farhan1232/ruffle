@@ -17,7 +17,9 @@ use image::imageops::FilterType;
 use ruffle_render::backend::{
     BitmapCacheEntry, Context3D, Context3DProfile, PixelBenderOutput, PixelBenderTarget,
 };
-use ruffle_render::backend::{RenderBackend, RenderMemoryUsage, ShapeHandle, ViewportDimensions};
+use ruffle_render::backend::{
+    PoolKeyReport, RenderBackend, RenderMemoryUsage, ShapeHandle, ViewportDimensions,
+};
 use ruffle_render::bitmap::{
     Bitmap, BitmapFormat, BitmapHandle, BitmapSource, PixelRegion, RgbaBufRead, SyncHandle,
 };
@@ -78,6 +80,9 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     viewport_scale_factor: f64,
     texture_pool: TexturePool,
     offscreen_texture_pool: TexturePool,
+    /// Frames drawn since the surface pool was last given the chance to
+    /// release targets it no longer needs.
+    frames_since_pool_trim: u32,
     pub(crate) offscreen_buffer_pool: Arc<BufferPool<wgpu::Buffer, BufferDimensions>>,
     dynamic_transforms: DynamicTransforms,
     active_frame: ActiveFrame,
@@ -215,6 +220,13 @@ impl WgpuRenderBackend<crate::target::TextureTarget> {
     }
 }
 
+/// How often the surface pool is offered the chance to release idle targets.
+/// Roughly every two seconds of play, which is long enough that a scene
+/// alternating between two shapes never loses the targets it is cycling
+/// through, and short enough that a crowd which has left gives its memory back
+/// while the player is still in the session.
+const FRAMES_BETWEEN_POOL_TRIMS: u32 = 60;
+
 impl<T: RenderTarget> WgpuRenderBackend<T> {
     pub fn new(descriptors: Arc<Descriptors>, target: T) -> Result<Self, Error> {
         if target.width() > descriptors.limits.max_texture_dimension_2d
@@ -275,6 +287,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             viewport_scale_factor: 1.0,
             texture_pool: TexturePool::new(crate::TextureKind::PoolMain),
             offscreen_texture_pool: TexturePool::new(crate::TextureKind::PoolOffscreen),
+            frames_since_pool_trim: 0,
             offscreen_buffer_pool: Arc::new(offscreen_buffer_pool),
             dynamic_transforms: transforms,
             active_frame,
@@ -465,7 +478,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         )))
     }
 
-    fn memory_usage(&self) -> Option<RenderMemoryUsage> {
+    fn memory_usage(&mut self) -> Option<RenderMemoryUsage> {
         let counters = self.descriptors.device.get_internal_counters().hal;
         let read = |value: isize| value.max(0) as usize;
         let (meshes, mesh_bytes) = Mesh::live_totals();
@@ -482,20 +495,34 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             .texture_pool
             .size_classes()
             .into_iter()
-            .chain(self.offscreen_texture_pool.size_classes())
-            .filter(|class| class.idle_entries > 0)
-            .map(|class| {
-                (
-                    class.width,
-                    class.height,
-                    class.sample_count,
-                    class.idle_entries,
-                    class.idle_bytes,
-                )
+            .map(|c| ("main", c))
+            .chain(
+                self.offscreen_texture_pool
+                    .size_classes()
+                    .into_iter()
+                    .map(|c| ("offscreen", c)),
+            )
+            .filter(|(_, class)| class.idle_entries > 0 || class.borrowed > 0)
+            .map(|(pool, c)| PoolKeyReport {
+                pool,
+                width: c.width,
+                height: c.height,
+                sample_count: c.sample_count,
+                format: format!("{:?}", c.format),
+                usage: format!("{:?}", c.usage),
+                idle_entries: c.idle_entries,
+                idle_bytes: c.idle_bytes,
+                borrowed: c.borrowed,
+                peak_borrowed: c.peak_borrowed,
+                recent_peak_borrowed: c.recent_peak_borrowed,
+                reuses: c.reuses,
+                misses_pool_empty: c.misses_pool_empty,
+                misses_new_key: c.misses_new_key,
+                retained_target: c.retained_target,
             })
             .collect();
-        classes.sort_by(|a, b| b.4.cmp(&a.4));
-        classes.truncate(6);
+        classes.sort_by(|a, b| b.idle_bytes.cmp(&a.idle_bytes));
+        classes.truncate(8);
 
         Some(RenderMemoryUsage {
             textures: read(counters.textures.read()),
@@ -524,7 +551,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             offscreen_pool_size_classes: off_classes,
             buffer_pool_idle_entries: buffer_idle,
             buffer_pool_idle_bytes: buffer_idle_bytes,
-            heaviest_pool_classes: classes,
+            pool_keys: classes,
             textures_created: stats.created_count.iter().sum(),
             texture_bytes_created: stats.created_bytes.iter().sum(),
             textures_dropped: stats.dropped_count.iter().sum(),
@@ -735,6 +762,17 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         self.active_frame
             .submit_for_target(&self.descriptors, &self.target, frame_output);
         self.offscreen_texture_pool = TexturePool::new(crate::TextureKind::PoolOffscreen);
+
+        // The offscreen pool above is rebuilt every frame, but the surface
+        // pool lives for the whole session, so it grows to the busiest frame
+        // it has ever drawn and stays there. Give it the chance to let go of
+        // targets it has stopped needing - rarely, because the point is to
+        // keep re-using them, not to churn.
+        self.frames_since_pool_trim += 1;
+        if self.frames_since_pool_trim >= FRAMES_BETWEEN_POOL_TRIMS {
+            self.frames_since_pool_trim = 0;
+            self.texture_pool.trim_idle();
+        }
         // there.
     }
 

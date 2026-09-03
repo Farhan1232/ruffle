@@ -17,7 +17,7 @@ use crate::context::UpdateContext;
 
 /// Identifies this instrumentation, so a log can be tied to the build that
 /// produced it. Bump it whenever the columns change.
-pub const INSTRUMENTATION_VERSION: &str = "aqw-gpu-diag-1";
+pub const INSTRUMENTATION_VERSION: &str = "aqw-gpu-diag-2-pooltrim";
 
 /// What a single still-resident movie is keeping alive.
 #[derive(Debug, Clone)]
@@ -121,8 +121,8 @@ pub struct MemoryReport {
     /// Readback/upload buffers idle in the renderer's buffer pool.
     pub buffer_pool_idle_entries: usize,
     pub buffer_pool_idle_bytes: usize,
-    /// The heaviest retained pool size classes, for the log.
-    pub heaviest_pool_classes: Vec<(u32, u32, u32, usize, usize)>,
+    /// The heaviest pool keys, with the whole key and its demand figures.
+    pub pool_keys: Vec<ruffle_render::backend::PoolKeyReport>,
     /// Textures created and dropped since start; differences between samples
     /// give the renderer's texture allocation churn.
     pub textures_created: u64,
@@ -168,7 +168,7 @@ impl MemoryReport {
             report.offscreen_pool_size_classes = gpu.offscreen_pool_size_classes;
             report.buffer_pool_idle_entries = gpu.buffer_pool_idle_entries;
             report.buffer_pool_idle_bytes = gpu.buffer_pool_idle_bytes;
-            report.heaviest_pool_classes = gpu.heaviest_pool_classes;
+            report.pool_keys = gpu.pool_keys;
             report.textures_created = gpu.textures_created;
             report.texture_bytes_created = gpu.texture_bytes_created;
             report.textures_dropped = gpu.textures_dropped;
@@ -308,14 +308,30 @@ impl MemoryReport {
         row
     }
 
-    /// The retained pool size classes, for a human reading the log.
-    pub fn top_pool_classes(&self) -> String {
+    /// The retained pool keys, for a human reading the log. Prints the whole
+    /// key and, next to the idle count, the most that key ever had lent out at
+    /// once - which is the number that says whether idle entries are retention
+    /// or genuine demand.
+    pub fn top_pool_keys(&self) -> String {
         let mut out = String::new();
-        for (width, height, samples, entries, bytes) in self.heaviest_pool_classes.iter().take(6) {
+        for k in self.pool_keys.iter().take(8) {
             let _ = write!(
                 out,
-                "\n    {width:>5} x {height:<5} x{samples}  {entries:>4} idle  {:>8} KiB",
-                bytes / 1024,
+                "\n    [{}] {:>5}x{:<5} x{} {:<12} {:<38} {:>4} idle {:>4} busy  peak {:>4} recent {:>4} keep {:>4}  {:>8} KiB  reuse {} miss {}",
+                k.pool,
+                k.width,
+                k.height,
+                k.sample_count,
+                k.format,
+                k.usage,
+                k.idle_entries,
+                k.borrowed,
+                k.peak_borrowed,
+                k.recent_peak_borrowed,
+                k.retained_target,
+                k.idle_bytes / 1024,
+                k.reuses,
+                k.misses_pool_empty + k.misses_new_key,
             );
         }
         out

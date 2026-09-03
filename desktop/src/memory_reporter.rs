@@ -266,7 +266,7 @@ impl MemoryReporter {
             p99,
             max,
             long,
-            report.top_pool_classes(),
+            report.top_pool_keys(),
             report.top_movies(5),
         );
     }

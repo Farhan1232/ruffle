@@ -22,6 +22,7 @@ RECOVER_*.fla
 
 # AQW diagnostic output - may contain the tester's login traffic, never commit
 aqw-diagnostic/
+aqw-retest/
 diagnostic-*.csv
 diagnostic-*.log
 diagnostic-*.txt

@@ -18,6 +18,29 @@ use std::rc::Rc;
 use std::sync::Arc;
 use swf::{Color, Rectangle, Twips};
 
+/// One render-target pool key, with what it holds and how much of it was ever
+/// wanted at once. `peak_borrowed` is the ceiling a pool can grow to, because
+/// a pool only builds a new entry when its free list is empty.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PoolKeyReport {
+    pub pool: &'static str,
+    pub width: u32,
+    pub height: u32,
+    pub sample_count: u32,
+    pub format: String,
+    pub usage: String,
+    pub idle_entries: usize,
+    pub idle_bytes: usize,
+    pub borrowed: usize,
+    pub peak_borrowed: usize,
+    pub recent_peak_borrowed: usize,
+    pub reuses: u64,
+    pub misses_pool_empty: u64,
+    pub misses_new_key: u64,
+    /// What the pool decided to keep for this key at its last trim.
+    pub retained_target: usize,
+}
+
 pub struct BitmapCacheEntry {
     pub handle: BitmapHandle,
     pub commands: CommandList,
@@ -77,9 +100,8 @@ pub struct RenderMemoryUsage {
     /// Readback/upload buffers idle in the renderer's buffer pool.
     pub buffer_pool_idle_entries: usize,
     pub buffer_pool_idle_bytes: usize,
-    /// The heaviest retained pool size classes, for the log: each is
-    /// `(width, height, samples, idle entries, idle bytes)`.
-    pub heaviest_pool_classes: Vec<(u32, u32, u32, usize, usize)>,
+    /// The heaviest pool keys, with the whole key and its demand figures.
+    pub pool_keys: Vec<PoolKeyReport>,
     /// Textures created and dropped since the process started; the difference
     /// between two samples is the churn over that span.
     pub textures_created: u64,
@@ -170,7 +192,7 @@ pub trait RenderBackend: Any {
 
     /// How much memory this backend currently holds in GPU resources, if it
     /// can tell. Used by memory diagnostics; `None` means "not available".
-    fn memory_usage(&self) -> Option<RenderMemoryUsage> {
+    fn memory_usage(&mut self) -> Option<RenderMemoryUsage> {
         None
     }
 
