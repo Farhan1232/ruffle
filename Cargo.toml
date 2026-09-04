@@ -17,7 +17,6 @@ members = [
     "frontend-utils",
 
     "render",
-    "tests/soak",
     "render/canvas",
     "render/naga-agal",
     "render/pixel_bender",
