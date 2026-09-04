@@ -176,6 +176,7 @@ impl Surface {
                         draw_encoder,
                         &dynamic_transforms.vertex_buffer,
                     );
+                    crate::render_stats::record_render_pass();
                     let mut render_pass = draw_encoder.scoped_render_pass(
                         format!(
                             "Chunked draw calls {}",
@@ -325,43 +326,42 @@ impl Surface {
                         )
                     };
 
+                    // The destination a blend reads is the same one frame
+                    // after frame, so the bind group pairing it with this
+                    // target is kept on the target rather than rebuilt.
                     let blend_bind_group =
-                        descriptors
-                            .device
-                            .create_bind_group(&wgpu::BindGroupDescriptor {
-                                label: create_debug_label!(
-                                    "Complex blend binds {:?} {}",
-                                    blend_mode,
-                                    if needs_stencil {
-                                        "(with stencil)"
-                                    } else {
-                                        "(Stencilless)"
-                                    }
-                                )
-                                .as_deref(),
-                                layout: &descriptors.bind_layouts.blend,
-                                entries: &[
-                                    wgpu::BindGroupEntry {
-                                        binding: 0,
-                                        resource: wgpu::BindingResource::TextureView(
-                                            parent_blend_buffer.view(),
-                                        ),
-                                    },
-                                    wgpu::BindGroupEntry {
-                                        binding: 1,
-                                        resource: wgpu::BindingResource::TextureView(
-                                            texture.view(),
-                                        ),
-                                    },
-                                    wgpu::BindGroupEntry {
-                                        binding: 2,
-                                        resource: wgpu::BindingResource::Sampler(
-                                            descriptors.bitmap_samplers.get_sampler(false, false),
-                                        ),
-                                    },
-                                ],
-                            });
+                        texture.binds().paired(parent_blend_buffer.binds_id(), || {
+                            descriptors
+                                .device
+                                .create_bind_group(&wgpu::BindGroupDescriptor {
+                                    label: create_debug_label!("Complex blend binds").as_deref(),
+                                    layout: &descriptors.bind_layouts.blend,
+                                    entries: &[
+                                        wgpu::BindGroupEntry {
+                                            binding: 0,
+                                            resource: wgpu::BindingResource::TextureView(
+                                                parent_blend_buffer.view(),
+                                            ),
+                                        },
+                                        wgpu::BindGroupEntry {
+                                            binding: 1,
+                                            resource: wgpu::BindingResource::TextureView(
+                                                texture.view(),
+                                            ),
+                                        },
+                                        wgpu::BindGroupEntry {
+                                            binding: 2,
+                                            resource: wgpu::BindingResource::Sampler(
+                                                descriptors
+                                                    .bitmap_samplers
+                                                    .get_sampler(false, false),
+                                            ),
+                                        },
+                                    ],
+                                })
+                        });
 
+                    crate::render_stats::record_render_pass();
                     let mut render_pass =
                         draw_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: create_debug_label!(

@@ -1,5 +1,6 @@
 use crate::Transforms;
 use crate::backend::RenderTargetMode;
+use crate::bind_cache::BindGroupCache;
 use crate::bounds::TargetRect;
 use crate::buffer_pool::{AlwaysCompatible, PoolEntry, PooledTexture, TexturePool};
 use crate::descriptors::Descriptors;
@@ -30,24 +31,21 @@ impl ResolveBuffer {
 
     pub fn new_manual(texture: wgpu::Texture) -> Self {
         Self {
-            texture: PoolOrArcTexture::Manual((
-                texture.clone(),
-                texture.create_view(&Default::default()),
-            )),
+            texture: PoolOrArcTexture::Manual(Box::new(ManualTexture::new(texture))),
         }
     }
 
     pub fn view(&self) -> &wgpu::TextureView {
         match self.texture {
             PoolOrArcTexture::Pool(ref texture) => &texture.1,
-            PoolOrArcTexture::Manual(ref texture) => &texture.1,
+            PoolOrArcTexture::Manual(ref texture) => &texture.view,
         }
     }
 
     pub fn texture(&self) -> &wgpu::Texture {
         match self.texture {
             PoolOrArcTexture::Pool(ref texture) => &texture.0,
-            PoolOrArcTexture::Manual(ref texture) => &texture.0,
+            PoolOrArcTexture::Manual(ref texture) => &texture.texture,
         }
     }
 
@@ -68,21 +66,75 @@ pub struct FrameBuffer {
 /// (when doing an offscreen render to a BitmapData texture)
 pub enum PoolOrArcTexture {
     Pool(PoolEntry<PooledTexture, AlwaysCompatible>),
-    Manual((wgpu::Texture, wgpu::TextureView)),
+    Manual(Box<ManualTexture>),
+}
+
+/// A target the renderer owns outright rather than borrowing from a pool: a
+/// `BitmapData`'s own texture, or a `cacheAsBitmap` backing store.
+#[derive(Debug)]
+pub struct ManualTexture {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    binds: BindGroupCache,
+}
+
+impl ManualTexture {
+    fn new(texture: wgpu::Texture) -> Self {
+        let view = texture.create_view(&Default::default());
+        Self {
+            texture,
+            view,
+            binds: BindGroupCache::default(),
+        }
+    }
 }
 
 impl PoolOrArcTexture {
     pub fn texture(&self) -> &wgpu::Texture {
         match self {
             PoolOrArcTexture::Pool(texture) => &texture.0,
-            PoolOrArcTexture::Manual(texture) => &texture.0,
+            PoolOrArcTexture::Manual(texture) => &texture.texture,
         }
     }
     pub fn view(&self) -> &wgpu::TextureView {
         match self {
             PoolOrArcTexture::Pool(texture) => &texture.1,
-            PoolOrArcTexture::Manual(texture) => &texture.1,
+            PoolOrArcTexture::Manual(texture) => &texture.view,
         }
+    }
+
+    /// The bind groups kept with this texture, so that compositing it does not
+    /// build a new one every frame.
+    pub fn binds(&self) -> &BindGroupCache {
+        match self {
+            PoolOrArcTexture::Pool(texture) => &texture.2,
+            PoolOrArcTexture::Manual(texture) => &texture.binds,
+        }
+    }
+
+    /// The bind group that samples this whole texture as a bitmap, which is how
+    /// a blended group's target is composited back.
+    pub fn bitmap_bind_group(&self, descriptors: &Descriptors) -> &wgpu::BindGroup {
+        self.binds().whole(|| {
+            descriptors
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    layout: &descriptors.bind_layouts.bitmap,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(self.view()),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(
+                                descriptors.bitmap_samplers.get_sampler(false, false),
+                            ),
+                        },
+                    ],
+                    label: create_debug_label!("Composite blended target").as_deref(),
+                })
+        })
     }
 }
 
@@ -104,24 +156,21 @@ impl FrameBuffer {
 
     pub fn new_manual(texture: wgpu::Texture) -> Self {
         Self {
-            texture: PoolOrArcTexture::Manual((
-                texture.clone(),
-                texture.create_view(&Default::default()),
-            )),
+            texture: PoolOrArcTexture::Manual(Box::new(ManualTexture::new(texture))),
         }
     }
 
     pub fn view(&self) -> &wgpu::TextureView {
         match self.texture {
             PoolOrArcTexture::Pool(ref texture) => &texture.1,
-            PoolOrArcTexture::Manual(ref texture) => &texture.1,
+            PoolOrArcTexture::Manual(ref texture) => &texture.view,
         }
     }
 
     pub fn texture(&self) -> &wgpu::Texture {
         match self.texture {
             PoolOrArcTexture::Pool(ref texture) => &texture.0,
-            PoolOrArcTexture::Manual(ref texture) => &texture.0,
+            PoolOrArcTexture::Manual(ref texture) => &texture.texture,
         }
     }
 
@@ -154,6 +203,12 @@ impl BlendBuffer {
 
     pub fn texture(&self) -> &wgpu::Texture {
         &self.texture.0
+    }
+
+    /// Identifies the texture behind this buffer, so a bind group naming it can
+    /// be cached against it.
+    pub fn binds_id(&self) -> u64 {
+        self.texture.2.id()
     }
 }
 

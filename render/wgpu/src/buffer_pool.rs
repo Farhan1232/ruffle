@@ -152,12 +152,16 @@ type Constructor<Type, Description> = Box<dyn Fn(&Descriptors, &Description) -> 
 /// A pooled render target. Accounted for in the memory report like any other
 /// texture Ruffle creates; see `tracked_texture_totals`.
 #[derive(Debug)]
-pub struct PooledTexture(pub wgpu::Texture, pub wgpu::TextureView);
+pub struct PooledTexture(
+    pub wgpu::Texture,
+    pub wgpu::TextureView,
+    pub(crate) crate::bind_cache::BindGroupCache,
+);
 
 impl PooledTexture {
     fn new(texture: wgpu::Texture, view: wgpu::TextureView) -> Self {
         crate::track_texture_created(&texture);
-        Self(texture, view)
+        Self(texture, view, crate::bind_cache::BindGroupCache::default())
     }
 }
 

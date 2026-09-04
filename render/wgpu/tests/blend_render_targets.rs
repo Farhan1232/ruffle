@@ -26,6 +26,7 @@ use ruffle_render_wgpu::buffer_pool::{PoolUsage, pool_usage};
 use ruffle_render_wgpu::descriptors::Descriptors;
 use ruffle_render_wgpu::target::TextureTarget;
 use ruffle_render_wgpu::wgpu;
+use ruffle_render_wgpu::{RenderStats, render_stats};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -50,7 +51,7 @@ fn crowds() -> Vec<usize> {
             .split(',')
             .map(|n| n.trim().parse().expect("crowd sizes are numbers"))
             .collect(),
-        Err(_) => vec![50, 100, 250, 500, 700],
+        Err(_) => vec![50, 100, 250, 500, 800],
     }
 }
 
@@ -102,6 +103,8 @@ fn crowd(bitmap: &BitmapHandle, count: usize, blend_mode: BlendMode) -> CommandL
 
 struct Measurement {
     usage: PoolUsage,
+    work: RenderStats,
+    frames: usize,
     /// Time to walk the commands and encode the frame, without waiting for the
     /// GPU. This is what a stuttering frame costs the main thread.
     cpu_times: Vec<Duration>,
@@ -150,6 +153,7 @@ fn measure(
     }
 
     let before = pool_usage();
+    let work_before = render_stats();
     let mut cpu_times = Vec::with_capacity(MEASURED_FRAMES);
     let mut frame_times = Vec::with_capacity(MEASURED_FRAMES);
     for _ in 0..MEASURED_FRAMES {
@@ -162,8 +166,26 @@ fn measure(
         frame_times.push(start.elapsed());
     }
 
+    let after = render_stats();
     Measurement {
         usage: pool_usage() - before,
+        work: RenderStats {
+            render_passes: after.render_passes - work_before.render_passes,
+            bind_groups_created: after.bind_groups_created - work_before.bind_groups_created,
+            bind_group_cache_hits: after.bind_group_cache_hits - work_before.bind_group_cache_hits,
+            bind_group_cache_misses: after.bind_group_cache_misses
+                - work_before.bind_group_cache_misses,
+            fastpath_eligible: after.fastpath_eligible - work_before.fastpath_eligible,
+            fastpath_used: after.fastpath_used - work_before.fastpath_used,
+            fallbacks: after
+                .fallbacks
+                .iter()
+                .zip(&work_before.fallbacks)
+                .map(|(a, b)| a - b)
+                .collect(),
+            ..after
+        },
+        frames: MEASURED_FRAMES,
         cpu_times,
         frame_times,
     }
@@ -204,28 +226,44 @@ fn a_crowded_room_does_not_ask_for_screen_sized_targets() {
             OBJECT.0, OBJECT.1, VIEWPORT.0, VIEWPORT.1
         );
         println!(
-            "{:>7}  {:>14}  {:>12}  {:>9}  {:>7}  {:>8}  {:>8}  {:>8}",
+            "{:>7} {:>10} {:>9} {:>8} {:>8} {:>8} {:>7} {:>7} {:>7} {:>7} {:>7}",
             "objects",
-            "target px/frame",
-            "target MB/fr",
-            "builds/fr",
-            "reuse",
+            "target MB",
+            "passes/fr",
+            "targets",
+            "bg made",
+            "bg hit%",
+            "fast%",
             "cpu ms",
             "mean ms",
-            "p95 ms"
+            "p95 ms",
+            "p99 ms"
         );
         for count in crowds() {
             let m = measure(&mut backend, &bitmap, count, blend_mode);
+            let frames = m.frames as f64;
+            let bg_total = m.work.bind_group_cache_hits + m.work.bind_group_cache_misses;
             println!(
-                "{:>7}  {:>14}  {:>12.1}  {:>9.1}  {:>6.1}%  {:>8.1}  {:>8.1}  {:>8.1}",
+                "{:>7} {:>10.1} {:>9.1} {:>8.1} {:>8.1} {:>7.1}% {:>6.0}% {:>7.1} {:>7.1} {:>7.1} {:>7.1}",
                 count,
-                m.per_frame_pixels(),
                 m.per_frame_pixels() as f64 * 4.0 / (1024.0 * 1024.0),
-                m.per_frame_builds(),
-                m.reuse_rate() * 100.0,
+                m.work.render_passes as f64 / frames,
+                m.work.blend_targets_live as f64,
+                m.work.bind_groups_created as f64 / frames,
+                if bg_total > 0 {
+                    100.0 * m.work.bind_group_cache_hits as f64 / bg_total as f64
+                } else {
+                    0.0
+                },
+                if m.work.fastpath_eligible > 0 {
+                    100.0 * m.work.fastpath_used as f64 / m.work.fastpath_eligible as f64
+                } else {
+                    0.0
+                },
                 Measurement::mean_ms(&m.cpu_times),
                 Measurement::mean_ms(&m.frame_times),
                 Measurement::percentile_ms(&m.frame_times, 0.95),
+                Measurement::percentile_ms(&m.frame_times, 0.99),
             );
 
             // The point of the exercise: an object a fraction of the screen's
@@ -363,4 +401,137 @@ fn filtered_cached_objects_re_use_their_filter_targets() {
         usage.builds,
         usage.takes
     );
+}
+
+/// A room shaped the way AdventureQuest Worlds' is, rather than the way the
+/// fast path likes.
+///
+/// The benchmark above blends a single bitmap, which is exactly the shape the
+/// direct path accepts, so it measures the best case. A real room is a mixture:
+/// some blended objects are cached or filtered and so reach the renderer as one
+/// `render_bitmap`, and some are containers whose children are drawn
+/// individually and must still be composited through a target. This measures
+/// what the mixture costs and, more to the point, what fraction of it the
+/// direct path can take - because if that fraction is small, the remaining
+/// per-target price is what has to be attacked next.
+fn mixed_room(
+    bitmap: &BitmapHandle,
+    count: usize,
+    cached_share: f64,
+    complex_share: f64,
+) -> CommandList {
+    let mut commands = CommandList::new();
+    for i in 0..count {
+        let x = ((i as f64 * 0.7548776662) % 1.0) * (VIEWPORT.0 - OBJECT.0) as f64;
+        let y = ((i as f64 * 0.5698402909) % 1.0) * (VIEWPORT.1 - OBJECT.1) as f64;
+        let place = |dx: f64, dy: f64| Transform {
+            matrix: Matrix::translate(Twips::from_pixels(x + dx), Twips::from_pixels(y + dy)),
+            color_transform: Default::default(),
+            perspective_projection: None,
+        };
+        let draw = |group: &mut CommandList, dx: f64, dy: f64| {
+            group.render_bitmap(
+                bitmap.clone(),
+                place(dx, dy),
+                false,
+                PixelSnapping::Never,
+                ruffle_render::bitmap::PixelRegion::for_whole_size(OBJECT.0, OBJECT.1),
+            );
+        };
+
+        let fraction = (i % 100) as f64 / 100.0;
+        let mut group = CommandList::new();
+        if fraction < cached_share {
+            // Cached or filtered: one bitmap, which the direct path can take.
+            draw(&mut group, 0.0, 0.0);
+        } else {
+            // A container: body, equipment and a name plate, drawn separately.
+            draw(&mut group, 0.0, 0.0);
+            draw(&mut group, 8.0, 40.0);
+            draw(&mut group, -6.0, 90.0);
+        }
+        let blend = if fraction < complex_share {
+            BlendMode::Multiply
+        } else {
+            BlendMode::Layer
+        };
+        commands.blend(group, RenderBlendMode::Builtin(blend));
+    }
+    commands
+}
+
+#[test]
+fn how_much_of_an_aqw_shaped_room_takes_the_direct_path() {
+    let Some(descriptors) = descriptors() else {
+        eprintln!("no GPU adapter available; skipping");
+        return;
+    };
+    let mut backend = build_backend(descriptors);
+    let bitmap = test_bitmap(&mut backend);
+
+    // The client's worst windows hold 800-920 targets at once.
+    println!("\n800 blended objects, mixtures of cached singles and multi-child containers");
+    println!(
+        "{:>8} {:>8} {:>10} {:>9} {:>8} {:>8} {:>7} {:>8} {:>8}",
+        "cached%",
+        "complex%",
+        "target MB",
+        "passes/fr",
+        "targets",
+        "bg made",
+        "fast%",
+        "mean ms",
+        "p95 ms"
+    );
+    for (cached, complex) in [(1.0, 0.0), (0.6, 0.1), (0.3, 0.2), (0.0, 0.2), (0.0, 1.0)] {
+        for _ in 0..WARMUP_FRAMES {
+            backend.submit_frame(
+                Color::BLACK,
+                mixed_room(&bitmap, 800, cached, complex),
+                vec![],
+            );
+            backend.capture_frame().expect("capture must succeed");
+        }
+        let before = pool_usage();
+        let work_before = render_stats();
+        let mut times = Vec::new();
+        for _ in 0..MEASURED_FRAMES {
+            let commands = mixed_room(&bitmap, 800, cached, complex);
+            let start = Instant::now();
+            backend.submit_frame(Color::BLACK, commands, vec![]);
+            backend.capture_frame().expect("capture must succeed");
+            times.push(start.elapsed());
+        }
+        let usage = pool_usage() - before;
+        let after = render_stats();
+        let frames = MEASURED_FRAMES as f64;
+        let eligible = after.fastpath_eligible - work_before.fastpath_eligible;
+        let used = after.fastpath_used - work_before.fastpath_used;
+        println!(
+            "{:>7.0}% {:>7.0}% {:>10.1} {:>9.1} {:>8.1} {:>8.1} {:>6.0}% {:>8.1} {:>8.1}",
+            cached * 100.0,
+            complex * 100.0,
+            usage.pixels as f64 * 4.0 / (1024.0 * 1024.0) / frames,
+            (after.render_passes - work_before.render_passes) as f64 / frames,
+            after.blend_targets_live as f64,
+            (after.bind_groups_created - work_before.bind_groups_created) as f64 / frames,
+            if eligible > 0 {
+                100.0 * used as f64 / eligible as f64
+            } else {
+                0.0
+            },
+            Measurement::mean_ms(&times),
+            Measurement::percentile_ms(&times, 0.95),
+        );
+    }
+    println!("\nwhy the rest could not:");
+    let stats = render_stats();
+    for (name, count) in ruffle_render_wgpu::render_stats::FALLBACK_NAMES
+        .iter()
+        .zip(&stats.fallbacks)
+    {
+        if *count > 0 {
+            println!("  {name:24} {count:>10}");
+        }
+    }
 }
