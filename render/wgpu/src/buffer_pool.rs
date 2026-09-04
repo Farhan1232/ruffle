@@ -185,13 +185,16 @@ impl TexturePool {
     /// of size classes.
     pub fn trim_idle(&mut self) {
         self.pools.retain(|_, pool| !pool.trim_idle());
+        self.trim_globals();
     }
 }
 
 #[derive(Debug, Default)]
 pub struct TexturePool {
     pools: FnvHashMap<TextureKey, BufferPool<PooledTexture, AlwaysCompatible>>,
-    globals_cache: FnvHashMap<GlobalsKey, Arc<Globals>>,
+    /// A projection per target size, with whether anything has asked for it
+    /// since the last trim.
+    globals_cache: FnvHashMap<GlobalsKey, (Arc<Globals>, bool)>,
 }
 
 impl TexturePool {
@@ -251,20 +254,41 @@ impl TexturePool {
         viewport_width: u32,
         viewport_height: u32,
     ) -> Arc<Globals> {
-        self.globals_cache
+        let entry = self
+            .globals_cache
             .entry(GlobalsKey {
                 viewport_width,
                 viewport_height,
             })
             .or_insert_with(|| {
-                Arc::new(Globals::new(
-                    &descriptors.device,
-                    &descriptors.bind_layouts.globals,
-                    viewport_width,
-                    viewport_height,
-                ))
-            })
-            .clone()
+                (
+                    Arc::new(Globals::new(
+                        &descriptors.device,
+                        &descriptors.bind_layouts.globals,
+                        viewport_width,
+                        viewport_height,
+                    )),
+                    true,
+                )
+            });
+        entry.1 = true;
+        entry.0.clone()
+    }
+
+    /// Forgets projections for sizes nothing has drawn since the last trim.
+    ///
+    /// A projection is a 64-byte buffer and a bind group, so a handful of them
+    /// costs nothing - but the offscreen pool's sizes follow the content, and
+    /// this cache used to be thrown away with the pool every frame. Now that
+    /// the pool survives, this has to be bounded the same way the free lists
+    /// are, or a long session accumulates one for every size it has ever drawn.
+    fn trim_globals(&mut self) {
+        self.globals_cache.retain(|_, (globals, used_since_trim)| {
+            // Still lent to a live target: keep it whatever the flag says.
+            let keep = *used_since_trim || Arc::strong_count(globals) > 1;
+            *used_since_trim = false;
+            keep
+        });
     }
 }
 
