@@ -6,13 +6,11 @@ use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-/// What the render-target pool has been asked for since the process started.
+/// What the render-target pools have been asked for since the process started.
 ///
-/// The pixels are the headline number: a frame's temporary targets are
-/// allocated, cleared, drawn into, sampled and composited, so what they cost in
-/// bandwidth is proportional to how many pixels of them a frame asks for. The
-/// builds are the other half - a target that has to be created is a driver
-/// allocation, which the pool exists to avoid.
+/// The per-pool counters below say what each size class is doing; these say
+/// what a stretch of rendering cost in total, which is what the
+/// `blend_render_targets` benchmark measures.
 static POOL_TAKES: AtomicU64 = AtomicU64::new(0);
 static POOL_BUILDS: AtomicU64 = AtomicU64::new(0);
 static POOL_PIXELS: AtomicU64 = AtomicU64::new(0);
@@ -50,6 +48,28 @@ pub fn pool_usage() -> PoolUsage {
     }
 }
 
+/// Which sizes a pool should give up so that what it keeps idle fits `budget`.
+///
+/// Sizes are given as `(when it was last asked for, the size, what it is
+/// holding idle)`. The ones least recently wanted go first, so the sizes the
+/// last few frames used are the ones that survive.
+fn sizes_over_budget<Key: Copy>(mut sizes: Vec<(u64, Key, usize)>, budget: usize) -> Vec<Key> {
+    let mut held: usize = sizes.iter().map(|(_, _, bytes)| bytes).sum();
+    if held <= budget {
+        return Vec::new();
+    }
+    sizes.sort_unstable_by_key(|(last_used, _, _)| *last_used);
+    let mut give_up = Vec::new();
+    for (_, key, bytes) in sizes {
+        if held <= budget {
+            break;
+        }
+        held -= bytes;
+        give_up.push(key);
+    }
+    give_up
+}
+
 /// Which of the two texture pools a measurement belongs to.
 ///
 /// They behave completely differently and have to be read apart: the main pool
@@ -66,10 +86,10 @@ pub enum PoolKind {
 
 /// Why a request could not be served from the free list.
 ///
-/// The first three are about the key: this pool is a map from an exact
+/// The first four are about the key: this pool is a map from an exact
 /// `(size, usage, format, sample_count)` to a free list, so a request whose key
 /// is not in the map has to build, and *which part* of the key was new is the
-/// whole question. The rest are about a key that exists.
+/// whole question. The last two are about a key that exists.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PoolMiss {
     /// A size this pool has never been asked for.
@@ -104,9 +124,9 @@ const POOL_KINDS: usize = 2;
 
 #[expect(clippy::declare_interior_mutable_const)]
 const ZERO: AtomicU64 = AtomicU64::new(0);
-static POOL_HITS: [AtomicU64; POOL_KINDS] = [ZERO; POOL_KINDS];
 #[expect(clippy::declare_interior_mutable_const)]
 const ZERO_ROW: [AtomicU64; MISS_REASONS] = [ZERO; MISS_REASONS];
+static POOL_HITS: [AtomicU64; POOL_KINDS] = [ZERO; POOL_KINDS];
 static POOL_MISSES: [[AtomicU64; MISS_REASONS]; POOL_KINDS] = [ZERO_ROW; POOL_KINDS];
 static POOL_MISS_BYTES: [[AtomicU64; MISS_REASONS]; POOL_KINDS] = [ZERO_ROW; POOL_KINDS];
 static POOL_EVICTIONS: [AtomicU64; POOL_KINDS] = [ZERO; POOL_KINDS];
@@ -183,10 +203,10 @@ pub fn pool_telemetry(kind: PoolKind) -> PoolTelemetry {
 /// objects asks this pool for a few hundred targets a frame across a couple of
 /// hundred live sizes, and at 64 MiB it spent between a quarter and a half of
 /// its misses on sizes it had held and given up moments earlier - it was
-/// evicting what the next frame wanted. The sweep in
-/// `render/wgpu/tests/cache_churn.rs` is what settled the figure;
-/// `RUFFLE_OFFSCREEN_POOL_MB` overrides it so the same build can be measured
-/// both ways.
+/// evicting what the next frame wanted. At 192 MiB the same room settles at a
+/// 100% hit rate, and 384 MiB buys nothing more.
+/// `RUFFLE_OFFSCREEN_POOL_MB` overrides it so one build can be measured both
+/// ways.
 fn offscreen_idle_budget() -> usize {
     const DEFAULT_MB: usize = 192;
     std::env::var("RUFFLE_OFFSCREEN_POOL_MB")
@@ -200,36 +220,47 @@ fn offscreen_idle_budget() -> usize {
 
 type PoolInner<T> = Mutex<PoolState<T>>;
 
+/// A pool's free list plus the demand figures the memory report needs.
+///
+/// `borrowed` and `peak_borrowed` are the important pair. A pool only ever
+/// builds a new entry when its free list is empty, so the number of entries it
+/// holds can never exceed the most it has ever had lent out at once - which
+/// means a pool sitting on hundreds of idle entries is evidence that hundreds
+/// really were in use simultaneously, not that look-up failed to re-use them.
 /// How many trim intervals of demand a pool remembers. A pool keeps enough
-/// entries for the busiest interval in this window, so demand has to have been
-/// low for the whole window before anything is released.
+/// entries for the busiest interval in this window, so demand has to stay low
+/// for the whole window before anything is released.
 const DEMAND_HISTORY: usize = 4;
 
-/// Entries kept beyond observed demand, so a scene that varies a little from
-/// interval to interval does not have to rebuild targets.
+/// Entries kept beyond observed demand, so that a scene which varies a little
+/// from interval to interval does not have to rebuild targets.
 const DEMAND_HEADROOM: usize = 2;
 
-/// A pool is never trimmed below this, which leaves small pools alone.
+/// A pool never trims below this, so small pools are left alone entirely.
 const MIN_RETAINED: usize = 4;
 
 /// Excess below this is not worth releasing.
 const TRIM_THRESHOLD: usize = 8;
 
-/// A pool's free list, plus what it needs to size itself.
-///
-/// `borrowed` is the pair to `available`: a pool only ever builds a new entry
-/// when its free list is empty, so the number of entries it holds can never
-/// exceed the most it has had lent out at once. A pool sitting on hundreds of
-/// idle entries is therefore not failing to re-use them - hundreds really were
-/// in use at the same time, once.
 #[derive(Debug)]
-struct PoolState<T> {
-    available: Vec<T>,
+pub(crate) struct PoolState<T> {
+    pub(crate) available: Vec<T>,
     borrowed: usize,
+    peak_borrowed: usize,
     /// Peak borrows during the current trim interval, and the peaks of the
-    /// last few intervals, which is what the retained set is sized from.
+    /// last few intervals. The retained working set is sized from these, so it
+    /// follows real demand instead of the highest burst of the session.
     interval_peak: usize,
     demand_history: [usize; DEMAND_HISTORY],
+    /// Peak since the last report, so a policy can see present demand rather
+    /// than the highest burst of the whole session.
+    recent_peak_borrowed: usize,
+    reuses: u64,
+    misses_pool_empty: u64,
+    misses_new_key: u64,
+    /// What the last trim decided to keep, so the report can show the target
+    /// beside the count it actually holds.
+    retained_target: usize,
 }
 
 impl<T> Default for PoolState<T> {
@@ -237,8 +268,14 @@ impl<T> Default for PoolState<T> {
         Self {
             available: Vec::new(),
             borrowed: 0,
+            peak_borrowed: 0,
             interval_peak: 0,
             demand_history: [0; DEMAND_HISTORY],
+            recent_peak_borrowed: 0,
+            reuses: 0,
+            misses_pool_empty: 0,
+            misses_new_key: 0,
+            retained_target: 0,
         }
     }
 }
@@ -247,6 +284,8 @@ impl<T> PoolState<T> {
     /// Records that an entry has been lent out.
     fn borrow(&mut self) {
         self.borrowed += 1;
+        self.peak_borrowed = self.peak_borrowed.max(self.borrowed);
+        self.recent_peak_borrowed = self.recent_peak_borrowed.max(self.borrowed);
         self.interval_peak = self.interval_peak.max(self.borrowed);
     }
 
@@ -272,6 +311,7 @@ impl<T> PoolState<T> {
 
         let demand = self.demand_history.iter().copied().max().unwrap_or(0);
         let retained = demand.saturating_add(DEMAND_HEADROOM).max(MIN_RETAINED);
+        self.retained_target = retained;
         let held = self.available.len() + self.borrowed;
         if held <= retained || held - retained < TRIM_THRESHOLD {
             return 0;
@@ -303,113 +343,26 @@ type Constructor<Type, Description> = Box<dyn Fn(&Descriptors, &Description) -> 
 pub struct PooledTexture(
     pub wgpu::Texture,
     pub wgpu::TextureView,
+    pub(crate) crate::TextureKind,
     pub(crate) crate::bind_cache::BindGroupCache,
 );
 
 impl PooledTexture {
-    fn new(texture: wgpu::Texture, view: wgpu::TextureView) -> Self {
-        crate::track_texture_created(&texture);
-        Self(texture, view, crate::bind_cache::BindGroupCache::default())
+    fn new(texture: wgpu::Texture, view: wgpu::TextureView, kind: crate::TextureKind) -> Self {
+        crate::track_texture_created(&texture, kind);
+        Self(
+            texture,
+            view,
+            kind,
+            crate::bind_cache::BindGroupCache::default(),
+        )
     }
 }
 
 impl Drop for PooledTexture {
     fn drop(&mut self) {
-        crate::track_texture_dropped(&self.0);
+        crate::track_texture_dropped(&self.0, self.2);
     }
-}
-
-impl TexturePool {
-    /// Releases render targets this pool has stopped needing.
-    ///
-    /// A pool grows to the busiest frame it has ever drawn and, without this,
-    /// stays there for the rest of the session: one crowded scene full of
-    /// blended objects, each of which is rendered through its own screen-sized
-    /// target, leaves hundreds of those targets behind long after the scene is
-    /// gone. They are still perfectly re-usable, so the aim is not to stop
-    /// pooling but to stop the pool being sized by a burst that ended minutes
-    /// ago.
-    ///
-    /// A size whose free list empties keeps its key, so a size that comes back
-    /// does not have to be registered again - unless nothing has wanted it for
-    /// a whole demand window, in which case the key goes too. That matters for
-    /// the offscreen pool, whose sizes follow the content rather than a handful
-    /// of size classes.
-    /// Whatever the demand history says, a pool never keeps more than
-    /// `idle_budget` in targets nothing is using: the sizes least recently
-    /// asked for are given up until it is under it again.
-    pub fn trim_idle(&mut self) {
-        self.pools
-            .retain(|_, size_pool| !size_pool.pool.trim_idle());
-        self.enforce_idle_budget();
-        self.trim_globals();
-        self.publish_size_report();
-    }
-
-    /// Gives up the sizes least recently asked for until what is held idle fits
-    /// the budget.
-    ///
-    /// Called whenever a size is met for the first time, not only when the pool
-    /// is trimmed: a scene of animating filtered objects can meet two thousand
-    /// sizes between one trim and the next, and a bound that applies only every
-    /// couple of seconds is not a bound on the peak. Only idle targets are
-    /// counted and released - what a frame is using is untouchable.
-    fn enforce_idle_budget(&mut self) {
-        let idle: Vec<(u64, TextureKey, usize)> = self
-            .pools
-            .iter()
-            .filter(|(_, size_pool)| size_pool.pool.idle_len() > 0)
-            .map(|(key, size_pool)| {
-                (
-                    size_pool.last_used,
-                    *key,
-                    size_pool.pool.idle_len() * key.bytes(),
-                )
-            })
-            .collect();
-        let index = self.kind as usize;
-        for key in sizes_over_budget(idle, self.idle_budget) {
-            if let Some(size_pool) = self.pools.get_mut(&key) {
-                let given_up = size_pool.pool.idle_len();
-                size_pool.pool.release_idle();
-                POOL_EVICTIONS[index].fetch_add(given_up as u64, Ordering::Relaxed);
-                POOL_EVICTED_BYTES[index]
-                    .fetch_add((given_up * key.bytes()) as u64, Ordering::Relaxed);
-                if !size_pool.pool.is_borrowed() {
-                    self.pools.remove(&key);
-                    // Remembered so that asking for this size again is
-                    // reported as the budget biting rather than as a size the
-                    // content had never used.
-                    if self.evicted.len() >= 16_384 {
-                        self.evicted.clear();
-                    }
-                    self.evicted.insert(key);
-                }
-            }
-        }
-    }
-}
-
-/// Which sizes a pool should give up so that what it keeps idle fits `budget`.
-///
-/// Sizes are given as `(when it was last asked for, the size, what it is
-/// holding idle)`. The ones least recently wanted go first, so the sizes the
-/// last few frames used are the ones that survive.
-fn sizes_over_budget<Key: Copy>(mut sizes: Vec<(u64, Key, usize)>, budget: usize) -> Vec<Key> {
-    let mut held: usize = sizes.iter().map(|(_, _, bytes)| bytes).sum();
-    if held <= budget {
-        return Vec::new();
-    }
-    sizes.sort_unstable_by_key(|(last_used, _, _)| *last_used);
-    let mut give_up = Vec::new();
-    for (_, key, bytes) in sizes {
-        if held <= budget {
-            break;
-        }
-        held -= bytes;
-        give_up.push(key);
-    }
-    give_up
 }
 
 /// One size's free list, and when that size was last asked for.
@@ -425,16 +378,19 @@ pub struct TexturePool {
     /// A projection per target size, with whether anything has asked for it
     /// since the last trim.
     globals_cache: FnvHashMap<GlobalsKey, (Arc<Globals>, bool)>,
+    /// Which pool this is, so the memory report can tell the surface pool
+    /// (which lives across frames) from the offscreen one (which the renderer
+    /// replaces every frame). Reporting only; it changes nothing.
+    kind: crate::TextureKind,
     /// Ticks on every request, so sizes can be ordered by how recently they
     /// were wanted.
     clock: u64,
     /// The most this pool will keep in idle targets.
     idle_budget: usize,
-    /// Which pool this is, so the two can be measured apart.
-    kind: PoolKind,
+    /// Which of the two pools this is, so the two can be measured apart.
+    pool_kind: PoolKind,
     /// Every size this pool has been asked for, with how many requests and how
-    /// many builds it took. This is what says whether the content asks for a
-    /// handful of sizes over and over or thousands of nearly identical ones.
+    /// many builds it took.
     size_history: FnvHashMap<(u32, u32), (u64, u64)>,
     /// Keys this pool gave up to stay inside its budget. A request for one of
     /// these is the budget's fault rather than the content's, and the two want
@@ -442,15 +398,128 @@ pub struct TexturePool {
     evicted: FnvHashSet<TextureKey>,
 }
 
+/// One pool key held by a [`TexturePool`], for the memory report.
+///
+/// This reports the *whole* key the pool is looked up by, not just the
+/// dimensions: two keys with identical width, height and sample count are
+/// still separate pools if their usage flags or format differ, and reporting
+/// only the size makes those look like one pool that is failing to re-use
+/// itself.
+#[derive(Clone, Copy, Debug)]
+pub struct PoolSizeClass {
+    pub width: u32,
+    pub height: u32,
+    pub sample_count: u32,
+    pub format: wgpu::TextureFormat,
+    pub usage: wgpu::TextureUsages,
+    /// Entries sitting unused in this key's free list.
+    pub idle_entries: usize,
+    pub idle_bytes: usize,
+    /// Entries currently lent out for this key.
+    pub borrowed: usize,
+    /// The most that were lent out at once for this key, ever. A pool can
+    /// only ever grow to this, so it is also the total the key holds.
+    pub peak_borrowed: usize,
+    /// The most lent out at once since the previous report, which is what a
+    /// retention policy would have to respect.
+    pub recent_peak_borrowed: usize,
+    /// Requests served from the free list, and requests that had to build a
+    /// new texture because the free list was empty.
+    pub reuses: u64,
+    pub misses_pool_empty: u64,
+    /// Requests that created this key's pool in the first place.
+    pub misses_new_key: u64,
+    /// What the last trim decided this key should keep. Comparing it with
+    /// `idle_entries` is what shows a crowded scene's surplus being released.
+    pub retained_target: usize,
+}
+
 impl TexturePool {
+    /// Releases render targets this pool has stopped needing, returning the
+    /// bytes released.
+    ///
+    /// A size whose free list empties keeps its key, so a size that comes back
+    /// does not have to be re-registered - unless nothing has wanted it for a
+    /// whole demand window, in which case the key goes too. That matters for
+    /// the offscreen pool, whose sizes follow the content rather than a handful
+    /// of size classes.
+    pub fn trim_idle(&mut self) -> usize {
+        let mut released = 0;
+        self.pools.retain(|_, size_pool| {
+            let (bytes, dormant) = size_pool
+                .pool
+                .trim_idle(|texture| crate::texture_bytes(&texture.0));
+            released += bytes;
+            if dormant {
+                released += size_pool
+                    .pool
+                    .available()
+                    .iter()
+                    .map(|(texture, _)| crate::texture_bytes(&texture.0))
+                    .sum::<usize>();
+            }
+            !dormant
+        });
+        released += self.enforce_idle_budget();
+        self.trim_globals();
+        self.publish_size_report();
+        released
+    }
+
+    /// Gives up the sizes least recently asked for until what is held idle fits
+    /// the budget, returning the bytes released.
+    ///
+    /// Called whenever a size is met for the first time, not only when the pool
+    /// is trimmed: a scene of animating filtered objects can meet two thousand
+    /// sizes between one trim and the next, and a bound that applies only every
+    /// couple of seconds is not a bound on the peak. Only idle targets are
+    /// counted and released - what a frame is using is untouchable.
+    fn enforce_idle_budget(&mut self) -> usize {
+        let idle: Vec<(u64, TextureKey, usize)> = self
+            .pools
+            .iter()
+            .filter(|(_, size_pool)| size_pool.pool.idle_len() > 0)
+            .map(|(key, size_pool)| {
+                (
+                    size_pool.last_used,
+                    *key,
+                    size_pool.pool.idle_len() * key.bytes(),
+                )
+            })
+            .collect();
+        let mut released = 0;
+        let index = self.pool_kind as usize;
+        for key in sizes_over_budget(idle, self.idle_budget) {
+            if let Some(size_pool) = self.pools.get_mut(&key) {
+                let given_up = size_pool.pool.idle_len();
+                released += given_up * key.bytes();
+                size_pool.pool.release_idle();
+                POOL_EVICTIONS[index].fetch_add(given_up as u64, Ordering::Relaxed);
+                POOL_EVICTED_BYTES[index]
+                    .fetch_add((given_up * key.bytes()) as u64, Ordering::Relaxed);
+                if !size_pool.pool.is_borrowed() {
+                    self.pools.remove(&key);
+                    // Remembered so that asking for this size again is reported
+                    // as the budget biting rather than as a size the content had
+                    // never used.
+                    if self.evicted.len() >= 16_384 {
+                        self.evicted.clear();
+                    }
+                    self.evicted.insert(key);
+                }
+            }
+        }
+        released
+    }
+
     /// A pool for the targets a frame is composed from.
     ///
     /// Those come in size classes, so there are tens of sizes rather than
     /// thousands and demand-aware trimming is enough on its own; the budget is
     /// a backstop, set well above the couple of hundred megabytes a crowded
     /// room's targets come to.
-    pub fn new() -> Self {
-        Self::with_idle_budget(256 * 1024 * 1024)
+    pub fn new(kind: crate::TextureKind) -> Self {
+        Self::with_idle_budget(kind, 256 * 1024 * 1024, PoolKind::Main)
     }
 
     /// A pool for the scratch space filters and offscreen draws run through.
@@ -463,21 +532,18 @@ impl TexturePool {
     /// keeping is the handful of sizes the last few frames used, a few
     /// megabytes; the budget is set an order of magnitude above that, and the
     /// sizes given up when it bites are the ones least recently wanted.
-    pub fn new_offscreen() -> Self {
-        Self::with_kind(offscreen_idle_budget(), PoolKind::Offscreen)
+    pub fn new_offscreen(kind: crate::TextureKind) -> Self {
+        Self::with_idle_budget(kind, offscreen_idle_budget(), PoolKind::Offscreen)
     }
 
-    fn with_idle_budget(idle_budget: usize) -> Self {
-        Self::with_kind(idle_budget, PoolKind::Main)
-    }
-
-    fn with_kind(idle_budget: usize, kind: PoolKind) -> Self {
+    fn with_idle_budget(kind: crate::TextureKind, idle_budget: usize, pool_kind: PoolKind) -> Self {
         Self {
             pools: Default::default(),
             globals_cache: Default::default(),
+            kind,
             clock: 0,
             idle_budget,
-            kind,
+            pool_kind,
             size_history: Default::default(),
             evicted: Default::default(),
         }
@@ -497,6 +563,7 @@ impl TexturePool {
             format,
             sample_count,
         };
+        let kind = self.kind;
         self.clock += 1;
         let clock = self.clock;
         // Classified before the entry is made, because the answer depends on
@@ -525,7 +592,7 @@ impl TexturePool {
                     usage,
                 });
                 let view = texture.create_view(&Default::default());
-                PooledTexture::new(texture, view)
+                PooledTexture::new(texture, view, kind)
             }));
             SizePool {
                 pool,
@@ -533,6 +600,9 @@ impl TexturePool {
             }
         });
         size_pool.last_used = clock;
+        if fresh_key {
+            size_pool.pool.note_new_key();
+        }
         let served_from_free_list = size_pool.pool.idle_len() > 0;
         let entry = size_pool.pool.take(descriptors, AlwaysCompatible);
         self.record_request(&key, miss_reason, served_from_free_list);
@@ -556,7 +626,7 @@ impl TexturePool {
         if self.evicted.contains(key) {
             return Some(PoolMiss::EvictedByBudget);
         }
-        // Which part of the key is the new one. Checked from the most specific
+        // Which part of the key is the new one, checked from the most specific
         // outwards, so a request that differs only in usage is not reported as
         // a whole new size.
         let mut size_seen = false;
@@ -594,7 +664,7 @@ impl TexturePool {
         miss_reason: Option<PoolMiss>,
         served_from_free_list: bool,
     ) {
-        let index = self.kind as usize;
+        let index = self.pool_kind as usize;
         let built = !served_from_free_list;
         let entry = self
             .size_history
@@ -632,8 +702,63 @@ impl TexturePool {
         };
         if let Ok(mut reports) = SIZE_REPORTS.lock() {
             let reports = reports.get_or_insert_with(Default::default);
-            reports[self.kind as usize] = report;
+            reports[self.pool_kind as usize] = report;
         }
+    }
+
+    /// `(distinct sizes pooled, textures idle in free lists, their bytes)`.
+    ///
+    /// A texture is idle when nothing is currently borrowing it: it has been
+    /// returned to its pool and is being kept for reuse. This is what the
+    /// pool retains between frames, as opposed to what a frame is using, and
+    /// so is the number that says whether a high working set is the
+    /// renderer's pooling rather than live content.
+    pub fn idle_totals(&self) -> (usize, usize, usize) {
+        let mut textures = 0;
+        let mut bytes = 0;
+        for pool in self.pools.values() {
+            for (texture, _) in pool.pool.available().iter() {
+                textures += 1;
+                bytes += crate::texture_bytes(&texture.0);
+            }
+        }
+        (self.pools.len(), textures, bytes)
+    }
+
+    /// Every size class this pool holds, heaviest first. Lets the report name
+    /// the sizes that are actually retaining memory rather than only totalling
+    /// them.
+    pub fn size_classes(&mut self) -> Vec<PoolSizeClass> {
+        let mut classes: Vec<_> = self
+            .pools
+            .iter_mut()
+            .map(|(key, pool)| {
+                let stats = pool.pool.stats();
+                let available = pool.pool.available();
+                let idle_bytes = available
+                    .iter()
+                    .map(|(texture, _)| crate::texture_bytes(&texture.0))
+                    .sum();
+                PoolSizeClass {
+                    width: key.size.width,
+                    height: key.size.height,
+                    sample_count: key.sample_count,
+                    format: key.format,
+                    usage: key.usage,
+                    idle_entries: available.len(),
+                    idle_bytes,
+                    borrowed: stats.0,
+                    peak_borrowed: stats.1,
+                    recent_peak_borrowed: stats.2,
+                    reuses: stats.3,
+                    misses_pool_empty: stats.4,
+                    misses_new_key: stats.5,
+                    retained_target: stats.6,
+                }
+            })
+            .collect();
+        classes.sort_by(|a, b| b.idle_bytes.cmp(&a.idle_bytes));
+        classes
     }
 
     pub fn get_globals(
@@ -763,20 +888,58 @@ impl<Type, Description: BufferDescription> BufferPool<Type, Description> {
         }
     }
 
-    /// Releases entries this pool has not needed for a while.
+    /// Records that this pool was created to serve a request, so the report
+    /// can tell a brand new key from one whose free list simply ran dry.
+    pub(crate) fn note_new_key(&self) {
+        self.lock().misses_new_key += 1;
+    }
+
+    /// Releases idle entries a pool has not needed for a while, and returns
+    /// the bytes released.
+    ///
+    /// A pool grows to the busiest moment it has ever seen and, with nothing
+    /// like this, stays there for the rest of the session: one crowded room
+    /// full of blended avatars leaves hundreds of screen-sized targets behind
+    /// long after the room empties. The entries are still perfectly reusable,
+    /// so the aim is not to stop pooling but to stop the pool being sized by
+    /// a burst that has been over for minutes.
     ///
     /// Sizing on the busiest of the last [`DEMAND_HISTORY`] intervals, and
-    /// releasing only half of whatever is above that, means a scene that keeps
-    /// needing its entries keeps them, and one whose demand has really gone
-    /// gives the memory back over the following intervals rather than in one
-    /// step that the next frame would have to undo.
-    ///
-    /// Returns whether the pool has gone dormant and is worth forgetting
-    /// entirely.
-    fn trim_idle(&mut self) -> bool {
+    /// releasing only half of whatever is above that, means a scene which
+    /// keeps needing the entries keeps them, and one whose demand has really
+    /// gone gives the memory back over the following intervals rather than
+    /// all at once.
+    /// Releases entries this pool has not needed for a while, returning the
+    /// bytes released so the report can show what a trim recovered.
+    /// Returns the bytes released and whether the pool has gone dormant and is
+    /// worth forgetting entirely.
+    pub(crate) fn trim_idle(&mut self, size_of: impl Fn(&Type) -> usize) -> (usize, bool) {
         let mut state = self.lock();
-        state.trim();
-        state.is_dormant()
+        let before: usize = state.available.iter().map(|(item, _)| size_of(item)).sum();
+        let released = state.trim();
+        let dormant = state.is_dormant();
+        if released == 0 {
+            return (0, dormant);
+        }
+        let after: usize = state.available.iter().map(|(item, _)| size_of(item)).sum();
+        (before.saturating_sub(after), dormant)
+    }
+
+    /// `(borrowed, peak, recent peak, reuses, empty-misses, new-key misses)`,
+    /// resetting the recent peak so the next report covers the next interval.
+    pub(crate) fn stats(&mut self) -> (usize, usize, usize, u64, u64, u64, usize) {
+        let mut state = self.lock();
+        let recent = state.recent_peak_borrowed;
+        state.recent_peak_borrowed = state.borrowed;
+        (
+            state.borrowed,
+            state.peak_borrowed,
+            recent,
+            state.reuses,
+            state.misses_pool_empty,
+            state.misses_new_key,
+            state.retained_target,
+        )
     }
 
     /// How many entries are sitting unused.
@@ -798,6 +961,22 @@ impl<Type, Description: BufferDescription> BufferPool<Type, Description> {
         self.available
             .lock()
             .expect("Should not be able to lock recursively")
+    }
+
+    /// The entries sitting unused in this pool, kept for reuse.
+    pub(crate) fn available(&self) -> AvailableGuard<'_, Type, Description> {
+        AvailableGuard(self.lock())
+    }
+
+    /// How many entries are idle in this pool, and the bytes they describe.
+    /// `size_of` maps a description to its byte size, since only the caller
+    /// knows how its descriptions are measured.
+    pub fn idle_totals(&self, size_of: impl Fn(&Description) -> usize) -> (usize, usize) {
+        let guard = self.lock();
+        (
+            guard.available.len(),
+            guard.available.iter().map(|(_, d)| size_of(d)).sum(),
+        )
     }
 
     pub fn take(
@@ -826,9 +1005,16 @@ impl<Type, Description: BufferDescription> BufferPool<Type, Description> {
         }
 
         let (item, used_description) = if let Some((_, best)) = best {
+            crate::texture_stats_record_pool_reuse();
+            guard.reuses += 1;
             guard.available.swap_remove(best)
         } else {
+            // The free list was empty. With `AlwaysCompatible` every entry in
+            // it matches, so this is the only way a request can miss: nothing
+            // is ever rejected for being busy, fenced or in the wrong state.
+            crate::texture_stats_record_pool_miss();
             POOL_BUILDS.fetch_add(1, Ordering::Relaxed);
+            guard.misses_pool_empty += 1;
             let item = (self.constructor)(descriptors, &description);
             (item, description)
         };
@@ -875,11 +1061,26 @@ impl<Type, Description: BufferDescription> Deref for PoolEntry<Type, Description
     }
 }
 
+/// Read-only view of a pool's free list, so the memory report can walk it
+/// without seeing the rest of the pool's state.
+pub(crate) struct AvailableGuard<'a, Type, Description: BufferDescription>(
+    std::sync::MutexGuard<'a, PoolState<(Type, Description)>>,
+);
+
+impl<Type, Description: BufferDescription> Deref for AvailableGuard<'_, Type, Description> {
+    type Target = Vec<(Type, Description)>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0.available
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A pool's state with `count` entries lent out and none returned.
+    /// A pool's state with `count` entries lent out and then returned, which
+    /// is the shape of a frame that renders `count` blended objects.
     fn with_burst(count: usize) -> PoolState<u32> {
         let mut state = PoolState::default();
         for _ in 0..count {
@@ -1004,47 +1205,6 @@ mod tests {
             state.trim();
             assert!(!state.is_dormant(), "forgot a size that is still in use");
         }
-    }
-
-    /// The budget is the backstop against a pool whose sizes follow the
-    /// content: however many of them there are, and whatever the demand history
-    /// says about each one on its own, the idle set stays bounded. This is the
-    /// case the offscreen pool met - 3,673 sizes holding 2.5 GiB between them.
-    #[test]
-    fn the_idle_budget_bounds_a_pool_of_many_sizes() {
-        const TARGET: usize = 1024 * 1024;
-        let sizes: Vec<(u64, u32, usize)> = (0..3673u32)
-            .map(|i| (u64::from(i), i, 4 * TARGET))
-            .collect();
-        let budget = 64 * TARGET;
-        let given_up = sizes_over_budget(sizes.clone(), budget);
-
-        let kept: usize = sizes
-            .iter()
-            .filter(|(_, key, _)| !given_up.contains(key))
-            .map(|(_, _, bytes)| bytes)
-            .sum();
-        assert!(
-            kept <= budget,
-            "kept {kept} bytes against a {budget} byte budget"
-        );
-        // What survives is what was wanted most recently.
-        assert!(
-            !given_up.contains(&3672),
-            "gave up the size the last frame used"
-        );
-        assert!(
-            given_up.contains(&0),
-            "kept the size nothing has used since"
-        );
-    }
-
-    /// A pool inside its budget is left entirely alone, so the sizes a scene is
-    /// cycling through are never taken away from it.
-    #[test]
-    fn a_pool_inside_its_budget_gives_up_nothing() {
-        let sizes: Vec<(u64, u32, usize)> = (0..20u32).map(|i| (u64::from(i), i, 1024)).collect();
-        assert!(sizes_over_budget(sizes, 64 * 1024).is_empty());
     }
 
     /// Small pools are left alone entirely.

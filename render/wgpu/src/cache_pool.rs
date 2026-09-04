@@ -194,7 +194,10 @@ impl CacheTexturePool {
                     self.idle_bytes = self.idle_bytes.saturating_sub(bytes);
                     EVICTIONS.fetch_add(1, Ordering::Relaxed);
                     EVICTED_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
-                    crate::track_texture_dropped(&recycled.texture);
+                    crate::track_texture_dropped(
+                        &recycled.texture,
+                        crate::TextureKind::CacheAsBitmap,
+                    );
                 }
                 self.classes.remove(&key);
             }
@@ -220,7 +223,10 @@ impl CacheTexturePool {
                     self.idle_bytes = self.idle_bytes.saturating_sub(bytes);
                     EVICTIONS.fetch_add(1, Ordering::Relaxed);
                     EVICTED_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
-                    crate::track_texture_dropped(&recycled.texture);
+                    crate::track_texture_dropped(
+                        &recycled.texture,
+                        crate::TextureKind::CacheAsBitmap,
+                    );
                 }
             }
         }

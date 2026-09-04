@@ -15,6 +15,10 @@ use std::fmt::Write as _;
 
 use crate::context::UpdateContext;
 
+/// Identifies this instrumentation, so a log can be tied to the build that
+/// produced it. Bump it whenever the columns change.
+pub const INSTRUMENTATION_VERSION: &str = "aqw-final-diag-4";
+
 /// What a single still-resident movie is keeping alive.
 #[derive(Debug, Clone)]
 pub struct MovieMemory {
@@ -89,6 +93,48 @@ pub struct MemoryReport {
     /// bytes; counted by Ruffle, so available on every backend.
     pub tracked_textures: usize,
     pub tracked_texture_bytes: usize,
+    /// Live textures split by what they are for - decoded bitmaps,
+    /// `cacheAsBitmap` backing stores, one-off render outputs, and render
+    /// targets from each pool - so that memory owned by live content can be
+    /// told apart from memory the renderer holds as reusable scratch.
+    pub texture_kind_names: &'static [&'static str],
+    pub texture_kind_live_counts: Vec<usize>,
+    pub texture_kind_live_bytes: Vec<usize>,
+    pub texture_kind_created: Vec<u64>,
+    pub texture_kind_created_bytes: Vec<u64>,
+    pub texture_kind_dropped: Vec<u64>,
+    pub texture_kind_dropped_bytes: Vec<u64>,
+    /// The most texture memory held at once over the whole run.
+    pub peak_texture_bytes: usize,
+    /// Pool free-list hits versus misses, which is how much the renderer is
+    /// actually re-using its render targets.
+    pub pool_reuses: u64,
+    pub pool_misses: u64,
+    /// Idle render targets in the surface pool (kept across frames) and the
+    /// offscreen pool (replaced each frame), with their size-class counts.
+    pub main_pool_idle_textures: usize,
+    pub main_pool_idle_bytes: usize,
+    pub main_pool_size_classes: usize,
+    pub offscreen_pool_idle_textures: usize,
+    pub offscreen_pool_idle_bytes: usize,
+    pub offscreen_pool_size_classes: usize,
+    /// Readback/upload buffers idle in the renderer's buffer pool.
+    pub buffer_pool_idle_entries: usize,
+    pub buffer_pool_idle_bytes: usize,
+    /// The heaviest pool keys, with the whole key and its demand figures.
+    pub pool_keys: Vec<ruffle_render::backend::PoolKeyReport>,
+    /// Textures created and dropped since start; differences between samples
+    /// give the renderer's texture allocation churn.
+    pub textures_created: u64,
+    pub texture_bytes_created: u64,
+    pub textures_dropped: u64,
+    pub texture_bytes_dropped: u64,
+    /// What the graphics backend is still holding underneath Ruffle's own
+    /// accounting, and what its allocator has taken from the driver.
+    pub hal: ruffle_render::backend::HalResourceUsage,
+    pub allocator: Option<ruffle_render::backend::AllocatorUsage>,
+    /// What the last frame cost in render passes, targets and bind groups.
+    pub work: ruffle_render::backend::RenderWorkUsage,
 }
 
 impl MemoryReport {
@@ -110,6 +156,32 @@ impl MemoryReport {
             report.mesh_bytes = gpu.mesh_bytes;
             report.tracked_textures = gpu.tracked_textures;
             report.tracked_texture_bytes = gpu.tracked_texture_bytes;
+            report.texture_kind_names = gpu.texture_kind_names;
+            report.texture_kind_live_counts = gpu.texture_kind_live_counts;
+            report.texture_kind_live_bytes = gpu.texture_kind_live_bytes;
+            report.texture_kind_created = gpu.texture_kind_created;
+            report.texture_kind_created_bytes = gpu.texture_kind_created_bytes;
+            report.texture_kind_dropped = gpu.texture_kind_dropped;
+            report.texture_kind_dropped_bytes = gpu.texture_kind_dropped_bytes;
+            report.peak_texture_bytes = gpu.peak_texture_bytes;
+            report.pool_reuses = gpu.pool_reuses;
+            report.hal = gpu.hal;
+            report.allocator = gpu.allocator;
+            report.work = gpu.work;
+            report.pool_misses = gpu.pool_misses;
+            report.main_pool_idle_textures = gpu.main_pool_idle_textures;
+            report.main_pool_idle_bytes = gpu.main_pool_idle_bytes;
+            report.main_pool_size_classes = gpu.main_pool_size_classes;
+            report.offscreen_pool_idle_textures = gpu.offscreen_pool_idle_textures;
+            report.offscreen_pool_idle_bytes = gpu.offscreen_pool_idle_bytes;
+            report.offscreen_pool_size_classes = gpu.offscreen_pool_size_classes;
+            report.buffer_pool_idle_entries = gpu.buffer_pool_idle_entries;
+            report.buffer_pool_idle_bytes = gpu.buffer_pool_idle_bytes;
+            report.pool_keys = gpu.pool_keys;
+            report.textures_created = gpu.textures_created;
+            report.texture_bytes_created = gpu.texture_bytes_created;
+            report.textures_dropped = gpu.textures_dropped;
+            report.texture_bytes_dropped = gpu.texture_bytes_dropped;
         }
 
         let movies: Vec<_> = context.library.known_movies().collect();
@@ -150,14 +222,100 @@ impl MemoryReport {
         report
     }
 
-    /// One CSV row, for logging a time series across a zone-change run.
-    pub fn csv_header() -> &'static str {
-        "elapsed_s,movies,characters,swf_bytes,bitmap_source_bytes,bitmap_decoded_bytes,pending_loaders,class_aliases,gc_allocation,gc_objects,gc_external_bytes,gpu_textures,gpu_texture_bytes,gpu_buffer_bytes,meshes,mesh_bytes,tracked_textures,tracked_texture_bytes"
+    /// The texture kinds this build reports, in the order their columns
+    /// appear. Taken from the renderer so the header cannot drift from the
+    /// rows; empty until the first sample, when the backend names them.
+    pub fn texture_kind_names(&self) -> &'static [&'static str] {
+        self.texture_kind_names
     }
 
+    /// The CSV header for a report, including one group of columns per
+    /// texture kind. `kinds` must be the same names the rows will use.
+    pub fn csv_header_for(kinds: &[&str]) -> String {
+        let mut header = String::from(
+            "elapsed_s,movies,characters,swf_bytes,bitmap_source_bytes,bitmap_decoded_bytes,\
+             pending_loaders,class_aliases,gc_allocation,gc_objects,gc_external_bytes,\
+             gpu_textures,gpu_texture_bytes,gpu_buffer_bytes,meshes,mesh_bytes,\
+             tracked_textures,tracked_texture_bytes,peak_texture_bytes,pool_reuses,pool_misses,\
+             main_pool_idle_textures,main_pool_idle_bytes,main_pool_size_classes,\
+             offscreen_pool_idle_textures,offscreen_pool_idle_bytes,offscreen_pool_size_classes,\
+             buffer_pool_idle_entries,buffer_pool_idle_bytes,\
+             textures_created,texture_bytes_created,textures_dropped,texture_bytes_dropped,\
+             hal_textures,hal_texture_views,hal_buffers,hal_bind_groups,hal_bind_group_layouts,\
+             hal_render_pipelines,hal_compute_pipelines,hal_pipeline_layouts,hal_samplers,\
+             hal_command_encoders,hal_shader_modules,hal_query_sets,hal_fences,\
+             hal_texture_memory,hal_buffer_memory,hal_memory_allocations,\
+             allocator_allocated_bytes,allocator_reserved_bytes,allocator_blocks,\
+             render_passes,blend_targets_live,blend_target_bytes,\
+             peak_blend_targets,peak_blend_target_bytes,\
+             bind_groups_created,bind_group_cache_hits,bind_group_cache_misses,\
+             trivial_blend_fastpath_eligible,trivial_blend_fastpath_used,\
+             render_ns_total,render_ns_cache_entries,render_ns_frame_commands,\
+             render_ns_queue_submit,render_slow_frames,render_very_slow_frames,\
+             render_slow_ns_cache_entries,render_slow_ns_frame_commands,\
+             render_slow_ns_queue_submit",
+        );
+        // Phase 1: pages, batched complex blends and the destination copies
+        // it measured and left.
+        header.push_str(
+            ",batch_eligible,batch_used,pages_last_frame,page_bytes_last_frame,\
+             peak_page_bytes,destination_copies,destination_copy_pixels,\
+             destination_copies_last_frame,destination_copy_pixels_last_frame,\
+             complex_blends,complex_blend_passes",
+        );
+        // Phase 2: what the caches and the offscreen pool allocate, and why.
+        header.push_str(
+            ",cache_redraws,cache_texture_kept,cache_allocated_pixels,\
+             cache_pool_takes,cache_pool_hits,cache_pool_builds,\
+             cache_pool_idle_textures,cache_pool_idle_bytes,\
+             offscreen_pool_hits,offscreen_pool_evictions,offscreen_pool_evicted_bytes,\
+             offscreen_pool_size_classes_seen,main_pool_hits",
+        );
+        for name in ruffle_render::backend::FALLBACK_COLUMN_NAMES {
+            let _ = write!(header, ",fastpath_fallback_{name}");
+        }
+        for name in ruffle_render::backend::PAGE_FALLBACK_COLUMN_NAMES {
+            let _ = write!(header, ",page_fallback_{name}");
+        }
+        for name in ruffle_render::cache_stats::CACHE_INVALIDATION_NAMES {
+            let _ = write!(header, ",cache_dirty_{name}");
+        }
+        for name in ruffle_render::cache_stats::CACHE_ALLOCATION_NAMES {
+            let _ = write!(header, ",cache_alloc_{name}");
+        }
+        for name in ruffle_render::backend::POOL_MISS_COLUMN_NAMES {
+            let _ = write!(header, ",offscreen_miss_{name}");
+        }
+        for name in ruffle_render::backend::POOL_MISS_COLUMN_NAMES {
+            let _ = write!(header, ",offscreen_miss_bytes_{name}");
+        }
+        for name in ruffle_render::backend::POOL_MISS_COLUMN_NAMES {
+            let _ = write!(header, ",main_miss_{name}");
+        }
+        for kind in kinds {
+            for suffix in [
+                "live",
+                "live_bytes",
+                "created",
+                "created_bytes",
+                "dropped",
+                "dropped_bytes",
+            ] {
+                let _ = write!(header, ",tex_{kind}_{suffix}");
+            }
+        }
+        header
+    }
+
+    /// The header for a report whose renderer could not name its kinds.
+    pub fn csv_header() -> String {
+        Self::csv_header_for(&[])
+    }
+
+    /// One CSV row, for logging a time series across a zone-change run.
     pub fn to_csv_row(&self, elapsed_s: f64) -> String {
-        format!(
-            "{:.1},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        let mut row = format!(
+            "{:.1},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             elapsed_s,
             self.movies.len(),
             self.characters,
@@ -176,7 +334,194 @@ impl MemoryReport {
             self.mesh_bytes,
             self.tracked_textures,
             self.tracked_texture_bytes,
-        )
+            self.peak_texture_bytes,
+            self.pool_reuses,
+            self.pool_misses,
+            self.main_pool_idle_textures,
+            self.main_pool_idle_bytes,
+            self.main_pool_size_classes,
+            self.offscreen_pool_idle_textures,
+            self.offscreen_pool_idle_bytes,
+            self.offscreen_pool_size_classes,
+            self.buffer_pool_idle_entries,
+            self.buffer_pool_idle_bytes,
+            self.textures_created,
+            self.texture_bytes_created,
+            self.textures_dropped,
+            self.texture_bytes_dropped,
+        );
+        let allocator = self.allocator.unwrap_or_default();
+        let _ = write!(
+            row,
+            ",{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            self.hal.textures,
+            self.hal.texture_views,
+            self.hal.buffers,
+            self.hal.bind_groups,
+            self.hal.bind_group_layouts,
+            self.hal.render_pipelines,
+            self.hal.compute_pipelines,
+            self.hal.pipeline_layouts,
+            self.hal.samplers,
+            self.hal.command_encoders,
+            self.hal.shader_modules,
+            self.hal.query_sets,
+            self.hal.fences,
+            self.hal.texture_memory,
+            self.hal.buffer_memory,
+            self.hal.memory_allocations,
+            allocator.allocated_bytes,
+            allocator.reserved_bytes,
+            allocator.blocks,
+            self.work.render_passes,
+            self.work.blend_targets,
+            self.work.blend_target_bytes,
+            self.work.peak_blend_targets,
+            self.work.peak_blend_target_bytes,
+            self.work.bind_groups_created,
+            self.work.bind_group_cache_hits,
+            self.work.bind_group_cache_misses,
+            self.work.fastpath_eligible,
+            self.work.fastpath_used,
+        );
+        let _ = write!(
+            row,
+            ",{},{},{},{},{},{},{},{},{}",
+            self.work.render_ns_total,
+            self.work.render_ns_cache_entries,
+            self.work.render_ns_frame_commands,
+            self.work.render_ns_queue_submit,
+            self.work.slow_frames,
+            self.work.very_slow_frames,
+            self.work.slow_ns_cache_entries,
+            self.work.slow_ns_frame_commands,
+            self.work.slow_ns_queue_submit,
+        );
+        let _ = write!(
+            row,
+            ",{},{},{},{},{},{},{},{},{},{},{}",
+            self.work.batch_eligible,
+            self.work.batch_used,
+            self.work.pages_last_frame,
+            self.work.page_bytes_last_frame,
+            self.work.peak_page_bytes,
+            self.work.destination_copies,
+            self.work.destination_copy_pixels,
+            self.work.destination_copies_last_frame,
+            self.work.destination_copy_pixels_last_frame,
+            self.work.complex_blends,
+            self.work.complex_blend_passes,
+        );
+        let _ = write!(
+            row,
+            ",{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            self.work.cache_redraws,
+            self.work.cache_texture_kept,
+            self.work.cache_allocated_pixels,
+            self.work.cache_pool_takes,
+            self.work.cache_pool_hits,
+            self.work.cache_pool_builds,
+            self.work.cache_pool_idle_textures,
+            self.work.cache_pool_idle_bytes,
+            self.work.offscreen_pool_hits,
+            self.work.offscreen_pool_evictions,
+            self.work.offscreen_pool_evicted_bytes,
+            self.work.offscreen_pool_size_classes_seen,
+            self.work.main_pool_hits,
+        );
+        for i in 0..ruffle_render::backend::FALLBACK_COLUMN_NAMES.len() {
+            let _ = write!(row, ",{}", self.work.fallbacks.get(i).copied().unwrap_or(0));
+        }
+        for i in 0..ruffle_render::backend::PAGE_FALLBACK_COLUMN_NAMES.len() {
+            let _ = write!(
+                row,
+                ",{}",
+                self.work.page_fallbacks.get(i).copied().unwrap_or(0)
+            );
+        }
+        for i in 0..ruffle_render::cache_stats::CACHE_INVALIDATION_NAMES.len() {
+            let _ = write!(
+                row,
+                ",{}",
+                self.work.cache_invalidations.get(i).copied().unwrap_or(0)
+            );
+        }
+        for i in 0..ruffle_render::cache_stats::CACHE_ALLOCATION_NAMES.len() {
+            let _ = write!(
+                row,
+                ",{}",
+                self.work.cache_allocations.get(i).copied().unwrap_or(0)
+            );
+        }
+        for i in 0..ruffle_render::backend::POOL_MISS_COLUMN_NAMES.len() {
+            let _ = write!(
+                row,
+                ",{}",
+                self.work.offscreen_pool_misses.get(i).copied().unwrap_or(0)
+            );
+        }
+        for i in 0..ruffle_render::backend::POOL_MISS_COLUMN_NAMES.len() {
+            let _ = write!(
+                row,
+                ",{}",
+                self.work
+                    .offscreen_pool_miss_bytes
+                    .get(i)
+                    .copied()
+                    .unwrap_or(0)
+            );
+        }
+        for i in 0..ruffle_render::backend::POOL_MISS_COLUMN_NAMES.len() {
+            let _ = write!(
+                row,
+                ",{}",
+                self.work.main_pool_misses.get(i).copied().unwrap_or(0)
+            );
+        }
+        for i in 0..self.texture_kind_names.len() {
+            let at = |v: &Vec<usize>| v.get(i).copied().unwrap_or(0);
+            let at64 = |v: &Vec<u64>| v.get(i).copied().unwrap_or(0);
+            let _ = write!(
+                row,
+                ",{},{},{},{},{},{}",
+                at(&self.texture_kind_live_counts),
+                at(&self.texture_kind_live_bytes),
+                at64(&self.texture_kind_created),
+                at64(&self.texture_kind_created_bytes),
+                at64(&self.texture_kind_dropped),
+                at64(&self.texture_kind_dropped_bytes),
+            );
+        }
+        row
+    }
+
+    /// The retained pool keys, for a human reading the log. Prints the whole
+    /// key and, next to the idle count, the most that key ever had lent out at
+    /// once - which is the number that says whether idle entries are retention
+    /// or genuine demand.
+    pub fn top_pool_keys(&self) -> String {
+        let mut out = String::new();
+        for k in self.pool_keys.iter().take(8) {
+            let _ = write!(
+                out,
+                "\n    [{}] {:>5}x{:<5} x{} {:<12} {:<38} {:>4} idle {:>4} busy  peak {:>4} recent {:>4} keep {:>4}  {:>8} KiB  reuse {} miss {}",
+                k.pool,
+                k.width,
+                k.height,
+                k.sample_count,
+                k.format,
+                k.usage,
+                k.idle_entries,
+                k.borrowed,
+                k.peak_borrowed,
+                k.recent_peak_borrowed,
+                k.retained_target,
+                k.idle_bytes / 1024,
+                k.reuses,
+                k.misses_pool_empty + k.misses_new_key,
+            );
+        }
+        out
     }
 
     /// The heaviest movies still resident, for a human reading the log.
@@ -216,4 +561,89 @@ pub struct LibraryMemoryUsage {
     pub sounds: usize,
     pub fonts: usize,
     pub has_domain: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The header and the rows have to have the same number of fields, or
+    /// every figure after the first mismatch is read against the wrong column
+    /// name - which is worse than not logging it at all. The counters are
+    /// written in one place and the names in another, so this is the only
+    /// thing keeping them together.
+    #[test]
+    fn every_csv_row_matches_its_header() {
+        const KINDS: &[&str] = &["bitmap", "cache_as_bitmap", "temporary", "pool_main"];
+        for kinds in [&[][..], KINDS] {
+            let header = MemoryReport::csv_header_for(kinds);
+            let mut report = MemoryReport::default();
+            report.texture_kind_names = kinds;
+            let row = report.to_csv_row(1.0);
+            assert_eq!(
+                header.split(',').count(),
+                row.split(',').count(),
+                "header has {} columns and a row has {}, for {} texture kinds",
+                header.split(',').count(),
+                row.split(',').count(),
+                kinds.len(),
+            );
+        }
+    }
+
+    /// Prints the whole header, for cross-checking against the verifier's
+    /// list of required columns. Not an assertion: run it with `--ignored
+    /// --nocapture` when the schema changes.
+    #[test]
+    #[ignore = "prints the schema; run deliberately"]
+    fn print_the_full_csv_header() {
+        const KINDS: &[&str] = &[
+            "bitmap",
+            "cache_as_bitmap",
+            "temporary",
+            "pool_main",
+            "pool_offscreen",
+        ];
+        println!(
+            "rss_bytes,peak_rss_bytes,private_bytes,peak_private_bytes,{},\
+             peak_gpu_texture_bytes_sampled,rust_heap_bytes,\
+             frames,frame_ms_mean,frame_ms_p50,frame_ms_p95,frame_ms_p99,frame_ms_max,\
+             frames_over_33ms,frames_over_100ms",
+            MemoryReport::csv_header_for(KINDS)
+        );
+    }
+
+    /// A column the verifier looks for must actually be written. These are the
+    /// ones the phase 2 report is read through.
+    #[test]
+    fn the_columns_the_verifier_needs_are_present() {
+        let header = MemoryReport::csv_header_for(&[]);
+        let columns: Vec<&str> = header.split(',').collect();
+        for wanted in [
+            "cache_redraws",
+            "cache_texture_kept",
+            "cache_alloc_shrank",
+            "cache_alloc_first_allocation",
+            "cache_dirty_transform_change",
+            "cache_pool_hits",
+            "cache_pool_builds",
+            "offscreen_miss_new_size_class",
+            "offscreen_miss_evicted_by_budget",
+            "offscreen_miss_free_list_empty",
+            "offscreen_miss_bytes_free_list_empty",
+            "offscreen_pool_size_classes_seen",
+            "pages_last_frame",
+            "destination_copies",
+            "complex_blends",
+            "page_fallback_alpha_mask",
+            "allocator_allocated_bytes",
+            "allocator_reserved_bytes",
+            "hal_textures",
+        ] {
+            assert!(
+                columns.contains(&wanted),
+                "the CSV has no {wanted} column, but the verifier reports it"
+            );
+        }
+    }
 }

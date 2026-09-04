@@ -107,7 +107,7 @@ impl PoolOrArcTexture {
     /// build a new one every frame.
     pub fn binds(&self) -> &BindGroupCache {
         match self {
-            PoolOrArcTexture::Pool(texture) => &texture.2,
+            PoolOrArcTexture::Pool(texture) => &texture.3,
             PoolOrArcTexture::Manual(texture) => &texture.binds,
         }
     }
@@ -208,7 +208,7 @@ impl BlendBuffer {
     /// Identifies the texture behind this buffer, so a bind group naming it can
     /// be cached against it.
     pub fn binds_id(&self) -> u64 {
-        self.texture.2.id()
+        self.texture.3.id()
     }
 }
 
@@ -436,6 +436,7 @@ impl CommandTarget {
         // If we aren't clearing with a color (eg a texture instead)
         // the there's no point in creating a new render pass that does nothing.
         if self.render_target_mode.color().is_some() {
+            crate::render_stats::record_render_pass();
             encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: create_debug_label!("Clearing command target").as_deref(),
                 color_attachments: &[self.color_attachments()],

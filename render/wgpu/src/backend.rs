@@ -16,9 +16,12 @@ use crate::{
 };
 use image::imageops::FilterType;
 use ruffle_render::backend::{
+    AllocatorUsage, HalResourceUsage, PoolKeyReport, RenderBackend, RenderMemoryUsage,
+    RenderWorkUsage, ShapeHandle, ViewportDimensions,
+};
+use ruffle_render::backend::{
     BitmapCacheEntry, Context3D, Context3DProfile, PixelBenderOutput, PixelBenderTarget,
 };
-use ruffle_render::backend::{RenderBackend, RenderMemoryUsage, ShapeHandle, ViewportDimensions};
 use ruffle_render::bitmap::{
     Bitmap, BitmapFormat, BitmapHandle, BitmapSource, PixelRegion, RgbaBufRead, SyncHandle,
 };
@@ -290,8 +293,8 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             meshes: Vec::new(),
             shape_tessellator: ShapeTessellator::new(),
             viewport_scale_factor: 1.0,
-            texture_pool: TexturePool::new(),
-            offscreen_texture_pool: TexturePool::new_offscreen(),
+            texture_pool: TexturePool::new(crate::TextureKind::PoolMain),
+            offscreen_texture_pool: TexturePool::new_offscreen(crate::TextureKind::PoolOffscreen),
             cache_texture_pool: crate::cache_pool::CacheTexturePool::new(),
             last_pool_trim: std::time::Instant::now(),
             offscreen_buffer_pool: Arc::new(offscreen_buffer_pool),
@@ -475,7 +478,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         );
 
         self.viewport_scale_factor = dimensions.scale_factor;
-        self.texture_pool = TexturePool::new();
+        self.texture_pool = TexturePool::new(crate::TextureKind::PoolMain);
     }
 
     fn create_context3d(
@@ -488,11 +491,52 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         )))
     }
 
-    fn memory_usage(&self) -> Option<RenderMemoryUsage> {
+    fn memory_usage(&mut self) -> Option<RenderMemoryUsage> {
         let counters = self.descriptors.device.get_internal_counters().hal;
         let read = |value: isize| value.max(0) as usize;
         let (meshes, mesh_bytes) = Mesh::live_totals();
-        let (tracked_textures, tracked_texture_bytes) = crate::tracked_texture_totals();
+        let stats = crate::texture_stats();
+        let (main_classes, main_idle, main_idle_bytes) = self.texture_pool.idle_totals();
+        let (off_classes, off_idle, off_idle_bytes) = self.offscreen_texture_pool.idle_totals();
+        let (buffer_idle, buffer_idle_bytes) = self
+            .offscreen_buffer_pool
+            .idle_totals(|dimensions| dimensions.padded_bytes_per_row as usize * dimensions.height);
+
+        // The heaviest retained size classes across both pools, so the log can
+        // name what is holding memory instead of only totalling it.
+        let mut classes: Vec<_> = self
+            .texture_pool
+            .size_classes()
+            .into_iter()
+            .map(|c| ("main", c))
+            .chain(
+                self.offscreen_texture_pool
+                    .size_classes()
+                    .into_iter()
+                    .map(|c| ("offscreen", c)),
+            )
+            .filter(|(_, class)| class.idle_entries > 0 || class.borrowed > 0)
+            .map(|(pool, c)| PoolKeyReport {
+                pool,
+                width: c.width,
+                height: c.height,
+                sample_count: c.sample_count,
+                format: format!("{:?}", c.format),
+                usage: format!("{:?}", c.usage),
+                idle_entries: c.idle_entries,
+                idle_bytes: c.idle_bytes,
+                borrowed: c.borrowed,
+                peak_borrowed: c.peak_borrowed,
+                recent_peak_borrowed: c.recent_peak_borrowed,
+                reuses: c.reuses,
+                misses_pool_empty: c.misses_pool_empty,
+                misses_new_key: c.misses_new_key,
+                retained_target: c.retained_target,
+            })
+            .collect();
+        classes.sort_by(|a, b| b.idle_bytes.cmp(&a.idle_bytes));
+        classes.truncate(8);
+
         Some(RenderMemoryUsage {
             textures: read(counters.textures.read()),
             texture_bytes: read(counters.texture_memory.read()),
@@ -500,8 +544,126 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             buffer_bytes: read(counters.buffer_memory.read()),
             meshes,
             mesh_bytes,
-            tracked_textures,
-            tracked_texture_bytes,
+            tracked_textures: stats.total_live_count(),
+            tracked_texture_bytes: stats.total_live_bytes(),
+            texture_kind_names: &crate::KIND_NAMES,
+            texture_kind_live_counts: stats.live_count.to_vec(),
+            texture_kind_live_bytes: stats.live_bytes.to_vec(),
+            texture_kind_created: stats.created_count.to_vec(),
+            texture_kind_created_bytes: stats.created_bytes.to_vec(),
+            texture_kind_dropped: stats.dropped_count.to_vec(),
+            texture_kind_dropped_bytes: stats.dropped_bytes.to_vec(),
+            peak_texture_bytes: stats.peak_live_bytes,
+            pool_reuses: stats.pool_reuses,
+            pool_misses: stats.pool_misses,
+            main_pool_idle_textures: main_idle,
+            main_pool_idle_bytes: main_idle_bytes,
+            main_pool_size_classes: main_classes,
+            offscreen_pool_idle_textures: off_idle,
+            offscreen_pool_idle_bytes: off_idle_bytes,
+            offscreen_pool_size_classes: off_classes,
+            buffer_pool_idle_entries: buffer_idle,
+            buffer_pool_idle_bytes: buffer_idle_bytes,
+            pool_keys: classes,
+            textures_created: stats.created_count.iter().sum(),
+            texture_bytes_created: stats.created_bytes.iter().sum(),
+            textures_dropped: stats.dropped_count.iter().sum(),
+            texture_bytes_dropped: stats.dropped_bytes.iter().sum(),
+            hal: HalResourceUsage {
+                textures: read(counters.textures.read()),
+                texture_views: read(counters.texture_views.read()),
+                buffers: read(counters.buffers.read()),
+                bind_groups: read(counters.bind_groups.read()),
+                bind_group_layouts: read(counters.bind_group_layouts.read()),
+                render_pipelines: read(counters.render_pipelines.read()),
+                compute_pipelines: read(counters.compute_pipelines.read()),
+                pipeline_layouts: read(counters.pipeline_layouts.read()),
+                samplers: read(counters.samplers.read()),
+                command_encoders: read(counters.command_encoders.read()),
+                shader_modules: read(counters.shader_modules.read()),
+                query_sets: read(counters.query_sets.read()),
+                fences: read(counters.fences.read()),
+                texture_memory: read(counters.texture_memory.read()),
+                buffer_memory: read(counters.buffer_memory.read()),
+                memory_allocations: read(counters.memory_allocations.read()),
+            },
+            allocator: self
+                .descriptors
+                .device
+                .generate_allocator_report()
+                .map(|report| AllocatorUsage {
+                    allocated_bytes: report.total_allocated_bytes,
+                    reserved_bytes: report.total_reserved_bytes,
+                    blocks: report.blocks.len(),
+                }),
+            work: {
+                let work = crate::render_stats();
+                let cache = ruffle_render::cache_stats::cache_stats();
+                let cache_pool = crate::cache_pool::cache_pool_stats(&self.cache_texture_pool);
+                let offscreen =
+                    crate::buffer_pool::pool_telemetry(crate::buffer_pool::PoolKind::Offscreen);
+                let main_pool =
+                    crate::buffer_pool::pool_telemetry(crate::buffer_pool::PoolKind::Main);
+                RenderWorkUsage {
+                    render_passes: work.render_passes_last_frame,
+                    blend_targets: work.blend_targets_live,
+                    blend_target_bytes: work.blend_target_bytes,
+                    peak_blend_targets: work.peak_blend_targets,
+                    peak_blend_target_bytes: work.peak_blend_target_bytes,
+                    bind_groups_created: work.bind_groups_created,
+                    bind_group_cache_hits: work.bind_group_cache_hits,
+                    bind_group_cache_misses: work.bind_group_cache_misses,
+                    fastpath_eligible: work.fastpath_eligible,
+                    fastpath_used: work.fastpath_used,
+                    fallback_names: crate::render_stats::FALLBACK_NAMES,
+                    fallbacks: work.fallbacks,
+                    render_ns_total: work.timing.total_ns,
+                    render_ns_cache_entries: work.timing.cache_entries_ns,
+                    render_ns_frame_commands: work.timing.frame_commands_ns,
+                    render_ns_queue_submit: work.timing.queue_submit_ns,
+                    slow_frames: work.timing.slow_frames,
+                    very_slow_frames: work.timing.very_slow_frames,
+                    slow_ns_cache_entries: work.timing.slow_cache_entries_ns,
+                    slow_ns_frame_commands: work.timing.slow_frame_commands_ns,
+                    slow_ns_queue_submit: work.timing.slow_queue_submit_ns,
+
+                    batch_eligible: work.batch_eligible,
+                    batch_used: work.batch_used,
+                    page_fallback_names: crate::render_stats::PAGE_FALLBACK_NAMES,
+                    page_fallbacks: work.page_fallbacks,
+                    pages_last_frame: work.pages_last_frame,
+                    page_bytes_last_frame: work.page_bytes_last_frame,
+                    peak_page_bytes: work.peak_page_bytes,
+                    destination_copies: work.destination_copies,
+                    destination_copy_pixels: work.destination_copy_pixels,
+                    destination_copies_last_frame: work.destination_copies_last_frame,
+                    destination_copy_pixels_last_frame: work.destination_copy_pixels_last_frame,
+                    complex_blends: work.complex_blends,
+                    complex_blend_passes: work.complex_blend_passes,
+
+                    cache_redraws: cache.redraws,
+                    cache_texture_kept: cache.texture_kept,
+                    cache_invalidation_names: ruffle_render::cache_stats::CACHE_INVALIDATION_NAMES,
+                    cache_invalidations: cache.invalidations,
+                    cache_allocation_names: ruffle_render::cache_stats::CACHE_ALLOCATION_NAMES,
+                    cache_allocations: cache.allocations,
+                    cache_allocated_pixels: cache.allocated_pixels,
+                    cache_pool_takes: cache_pool.takes,
+                    cache_pool_hits: cache_pool.hits,
+                    cache_pool_builds: cache_pool.builds,
+                    cache_pool_idle_textures: cache_pool.idle_textures,
+                    cache_pool_idle_bytes: cache_pool.idle_bytes,
+                    pool_miss_names: crate::buffer_pool::POOL_MISS_NAMES,
+                    offscreen_pool_hits: offscreen.hits,
+                    offscreen_pool_misses: offscreen.misses,
+                    offscreen_pool_miss_bytes: offscreen.miss_bytes,
+                    offscreen_pool_evictions: offscreen.evictions,
+                    offscreen_pool_evicted_bytes: offscreen.evicted_bytes,
+                    offscreen_pool_size_classes_seen: offscreen.size_classes_seen,
+                    main_pool_hits: main_pool.hits,
+                    main_pool_misses: main_pool.misses,
+                }
+            },
         })
     }
 
@@ -817,7 +979,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             extent,
         );
 
-        let handle = BitmapHandle(Arc::new(Texture::new(texture)));
+        let handle = BitmapHandle(Arc::new(Texture::new(texture, crate::TextureKind::Bitmap)));
 
         Ok(handle)
     }
@@ -1088,7 +1250,10 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                             | wgpu::TextureUsages::RENDER_ATTACHMENT
                             | wgpu::TextureUsages::COPY_SRC,
                     });
-                BitmapHandle(Arc::new(Texture::new(texture)))
+                BitmapHandle(Arc::new(Texture::new(
+                    texture,
+                    crate::TextureKind::Temporary,
+                )))
             }
         };
 
@@ -1261,7 +1426,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         Ok(BitmapHandle(Arc::new(if pooling {
             Texture::new_pooled(texture, self.cache_texture_pool.clone())
         } else {
-            Texture::new(texture)
+            Texture::new(texture, crate::TextureKind::CacheAsBitmap)
         })))
     }
 
