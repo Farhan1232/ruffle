@@ -126,6 +126,11 @@ impl BufferDescription for BufferDimensions {
             None
         }
     }
+
+    fn best_possible_cost() -> Option<u64> {
+        // A buffer of exactly the right size wastes nothing.
+        Some(0)
+    }
 }
 
 pub fn capture_image<R, F: FnOnce(&[u8], u32) -> R>(

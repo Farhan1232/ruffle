@@ -133,6 +133,19 @@ impl<T> PoolState<T> {
         self.available.truncate(self.available.len() - release);
         release
     }
+
+    /// Whether nothing has asked for this size for a whole demand window.
+    ///
+    /// Sizes that keep coming back are worth keeping registered, but a size
+    /// that has not been wanted for the whole window is not: the offscreen
+    /// pool's sizes follow the content, so a long session meets thousands of
+    /// them and would otherwise keep [`MIN_RETAINED`] targets for every one it
+    /// had ever seen.
+    fn is_dormant(&self) -> bool {
+        self.borrowed == 0
+            && self.interval_peak == 0
+            && self.demand_history.iter().all(|&peak| peak == 0)
+    }
 }
 type Constructor<Type, Description> = Box<dyn Fn(&Descriptors, &Description) -> Type>;
 
@@ -165,12 +178,13 @@ impl TexturePool {
     /// pooling but to stop the pool being sized by a burst that ended minutes
     /// ago.
     ///
-    /// Keys are kept even when their free list empties, so a size that comes
-    /// back does not have to be registered again.
+    /// A size whose free list empties keeps its key, so a size that comes back
+    /// does not have to be registered again - unless nothing has wanted it for
+    /// a whole demand window, in which case the key goes too. That matters for
+    /// the offscreen pool, whose sizes follow the content rather than a handful
+    /// of size classes.
     pub fn trim_idle(&mut self) {
-        for pool in self.pools.values_mut() {
-            pool.trim_idle();
-        }
+        self.pools.retain(|_, pool| !pool.trim_idle());
     }
 }
 
@@ -278,6 +292,16 @@ pub trait BufferDescription: Clone + Debug {
     /// Cost is an arbitrary unit, but lower is better.
     /// None means that the other buffer cannot be used in place of this one.
     fn cost_to_use(&self, other: &Self) -> Option<Self::Cost>;
+
+    /// The lowest cost [`cost_to_use`](Self::cost_to_use) can return.
+    ///
+    /// An entry that costs this much cannot be beaten, so the search for one
+    /// stops as soon as it finds it. Without that, taking an entry scans the
+    /// whole free list, and a frame that takes hundreds of render targets
+    /// spends its time walking a list that shrinks by one each time.
+    fn best_possible_cost() -> Option<Self::Cost> {
+        None
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -287,6 +311,11 @@ impl BufferDescription for AlwaysCompatible {
     type Cost = ();
 
     fn cost_to_use(&self, _other: &Self) -> Option<()> {
+        Some(())
+    }
+
+    fn best_possible_cost() -> Option<()> {
+        // Every entry in one of these pools is an equally good answer.
         Some(())
     }
 }
@@ -317,8 +346,13 @@ impl<Type, Description: BufferDescription> BufferPool<Type, Description> {
     /// needing its entries keeps them, and one whose demand has really gone
     /// gives the memory back over the following intervals rather than in one
     /// step that the next frame would have to undo.
-    fn trim_idle(&mut self) {
-        self.lock().trim();
+    ///
+    /// Returns whether the pool has gone dormant and is worth forgetting
+    /// entirely.
+    fn trim_idle(&mut self) -> bool {
+        let mut state = self.lock();
+        state.trim();
+        state.is_dormant()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, PoolState<(Type, Description)>> {
@@ -334,15 +368,20 @@ impl<Type, Description: BufferDescription> BufferPool<Type, Description> {
     ) -> PoolEntry<Type, Description> {
         let mut guard = self.lock();
         guard.borrow();
+        let unbeatable = Description::best_possible_cost();
         let mut best: Option<(Description::Cost, usize)> = None;
         for i in 0..guard.available.len() {
             if let Some(cost) = description.cost_to_use(&guard.available[i].1) {
+                let unbeatable = Some(&cost) == unbeatable.as_ref();
                 if let Some(best) = &mut best {
                     if best.0 > cost {
                         *best = (cost, i);
                     }
-                } else if best.is_none() {
+                } else {
                     best = Some((cost, i));
+                }
+                if unbeatable {
+                    break;
                 }
             }
         }
@@ -498,6 +537,34 @@ mod tests {
             60,
             "a burst that keeps recurring should keep its targets"
         );
+    }
+
+    /// A size the content has stopped using is forgotten, so that a long
+    /// session does not keep a few targets for every size it has ever met.
+    #[test]
+    fn a_size_that_stops_being_used_is_forgotten() {
+        let mut state = with_burst(6);
+        for _ in 0..DEMAND_HISTORY {
+            assert!(!state.is_dormant(), "forgotten while still in demand");
+            state.trim();
+        }
+        state.trim();
+        assert!(
+            state.is_dormant(),
+            "a size unused for a whole window is still registered"
+        );
+    }
+
+    /// A size still being drawn every interval is never forgotten, however
+    /// small its pool.
+    #[test]
+    fn a_size_in_use_is_never_forgotten() {
+        let mut state = with_burst(6);
+        for _ in 0..20 {
+            interval(&mut state, 1);
+            state.trim();
+            assert!(!state.is_dormant(), "forgot a size that is still in use");
+        }
     }
 
     /// Small pools are left alone entirely.

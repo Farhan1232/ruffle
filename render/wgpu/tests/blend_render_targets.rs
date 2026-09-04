@@ -13,9 +13,10 @@
 //! cargo test --release -p ruffle_render_wgpu --test blend_render_targets -- --nocapture
 //! ```
 
-use ruffle_render::backend::{RenderBackend, ViewportDimensions};
+use ruffle_render::backend::{BitmapCacheEntry, RenderBackend, ViewportDimensions};
 use ruffle_render::bitmap::{Bitmap, BitmapFormat, BitmapHandle, PixelSnapping};
 use ruffle_render::commands::{CommandHandler, CommandList, RenderBlendMode};
+use ruffle_render::filters::Filter;
 use ruffle_render::matrix::Matrix;
 use ruffle_render::transform::Transform;
 use ruffle_render_wgpu::backend::{
@@ -25,9 +26,10 @@ use ruffle_render_wgpu::buffer_pool::{PoolUsage, pool_usage};
 use ruffle_render_wgpu::descriptors::Descriptors;
 use ruffle_render_wgpu::target::TextureTarget;
 use ruffle_render_wgpu::wgpu;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use swf::{BlendMode, Color, Twips};
+use swf::{BlendMode, Color, Fixed8, Fixed16, GlowFilter, GlowFilterFlags, Twips};
 
 /// The client's window.
 const VIEWPORT: (u32, u32) = (1920, 985);
@@ -38,7 +40,19 @@ const OBJECT: (u32, u32) = (150, 200);
 
 /// Room sizes to measure, from a quiet map to the worst the client has
 /// reported.
-const CROWDS: [usize; 5] = [50, 100, 250, 500, 700];
+///
+/// Overridable, because the full-viewport renderer this is measured against
+/// needs about 7 MiB of render target per object and cannot reach the top of
+/// the list on a machine with 8 GiB of memory.
+fn crowds() -> Vec<usize> {
+    match std::env::var("RUFFLE_BENCH_CROWDS") {
+        Ok(list) => list
+            .split(',')
+            .map(|n| n.trim().parse().expect("crowd sizes are numbers"))
+            .collect(),
+        Err(_) => vec![50, 100, 250, 500, 700],
+    }
+}
 
 const WARMUP_FRAMES: usize = 3;
 const MEASURED_FRAMES: usize = 10;
@@ -88,6 +102,10 @@ fn crowd(bitmap: &BitmapHandle, count: usize, blend_mode: BlendMode) -> CommandL
 
 struct Measurement {
     usage: PoolUsage,
+    /// Time to walk the commands and encode the frame, without waiting for the
+    /// GPU. This is what a stuttering frame costs the main thread.
+    cpu_times: Vec<Duration>,
+    /// Time until the frame is actually on screen, GPU included.
     frame_times: Vec<Duration>,
 }
 
@@ -107,21 +125,12 @@ impl Measurement {
         1.0 - self.usage.builds as f64 / self.usage.takes as f64
     }
 
-    fn mean_ms(&self) -> f64 {
-        self.frame_times
-            .iter()
-            .map(|d| d.as_secs_f64())
-            .sum::<f64>()
-            * 1000.0
-            / self.frame_times.len() as f64
+    fn mean_ms(times: &[Duration]) -> f64 {
+        times.iter().map(|d| d.as_secs_f64()).sum::<f64>() * 1000.0 / times.len() as f64
     }
 
-    fn percentile_ms(&self, p: f64) -> f64 {
-        let mut sorted: Vec<f64> = self
-            .frame_times
-            .iter()
-            .map(|d| d.as_secs_f64() * 1000.0)
-            .collect();
+    fn percentile_ms(times: &[Duration], p: f64) -> f64 {
+        let mut sorted: Vec<f64> = times.iter().map(|d| d.as_secs_f64() * 1000.0).collect();
         sorted.sort_by(|a, b| a.partial_cmp(b).expect("frame times are finite"));
         let index = ((sorted.len() as f64 - 1.0) * p).round() as usize;
         sorted[index]
@@ -141,11 +150,13 @@ fn measure(
     }
 
     let before = pool_usage();
+    let mut cpu_times = Vec::with_capacity(MEASURED_FRAMES);
     let mut frame_times = Vec::with_capacity(MEASURED_FRAMES);
     for _ in 0..MEASURED_FRAMES {
         let commands = crowd(bitmap, count, blend_mode);
         let start = Instant::now();
         backend.submit_frame(Color::BLACK, commands, vec![]);
+        cpu_times.push(start.elapsed());
         // The capture waits for the GPU, so the frame is really finished.
         backend.capture_frame().expect("capture must succeed");
         frame_times.push(start.elapsed());
@@ -153,6 +164,7 @@ fn measure(
 
     Measurement {
         usage: pool_usage() - before,
+        cpu_times,
         frame_times,
     }
 }
@@ -192,20 +204,28 @@ fn a_crowded_room_does_not_ask_for_screen_sized_targets() {
             OBJECT.0, OBJECT.1, VIEWPORT.0, VIEWPORT.1
         );
         println!(
-            "{:>7}  {:>14}  {:>12}  {:>9}  {:>8}  {:>8}  {:>8}",
-            "objects", "target px/frame", "target MB/fr", "builds/fr", "reuse", "mean ms", "p95 ms"
+            "{:>7}  {:>14}  {:>12}  {:>9}  {:>7}  {:>8}  {:>8}  {:>8}",
+            "objects",
+            "target px/frame",
+            "target MB/fr",
+            "builds/fr",
+            "reuse",
+            "cpu ms",
+            "mean ms",
+            "p95 ms"
         );
-        for count in CROWDS {
+        for count in crowds() {
             let m = measure(&mut backend, &bitmap, count, blend_mode);
             println!(
-                "{:>7}  {:>14}  {:>12.1}  {:>9.1}  {:>7.1}%  {:>8.1}  {:>8.1}",
+                "{:>7}  {:>14}  {:>12.1}  {:>9.1}  {:>6.1}%  {:>8.1}  {:>8.1}  {:>8.1}",
                 count,
                 m.per_frame_pixels(),
                 m.per_frame_pixels() as f64 * 4.0 / (1024.0 * 1024.0),
                 m.per_frame_builds(),
                 m.reuse_rate() * 100.0,
-                m.mean_ms(),
-                m.percentile_ms(0.95),
+                Measurement::mean_ms(&m.cpu_times),
+                Measurement::mean_ms(&m.frame_times),
+                Measurement::percentile_ms(&m.frame_times, 0.95),
             );
 
             // The point of the exercise: an object a fraction of the screen's
@@ -240,5 +260,107 @@ fn a_steady_scene_stops_building_targets() {
         m.reuse_rate() > 0.99,
         "only {:.1}% of targets were re-used in a scene that never changes",
         m.reuse_rate() * 100.0
+    );
+}
+
+/// A filtered `cacheAsBitmap` object, which is how AdventureQuest Worlds draws
+/// a glowing name plate or a spell effect. Ruffle redraws one of these into its
+/// cache texture whenever it changes, applying the filter through temporary
+/// targets of its own.
+fn cache_entries(
+    bitmap: &BitmapHandle,
+    caches: &[(BitmapHandle, u32, u32)],
+) -> Vec<BitmapCacheEntry> {
+    caches
+        .iter()
+        .map(|(handle, width, height)| BitmapCacheEntry {
+            handle: handle.clone(),
+            commands: {
+                let mut commands = CommandList::new();
+                commands.render_bitmap(
+                    bitmap.clone(),
+                    Transform::default(),
+                    false,
+                    PixelSnapping::Never,
+                    ruffle_render::bitmap::PixelRegion::for_whole_size(*width, *height),
+                );
+                commands
+            },
+            clear: Color::from_rgba(0),
+            filters: vec![Filter::GlowFilter(GlowFilter {
+                color: Color::WHITE,
+                blur_x: Fixed16::from_f32(4.0),
+                blur_y: Fixed16::from_f32(4.0),
+                strength: Fixed8::ONE,
+                flags: GlowFilterFlags::from_passes(1),
+            })],
+        })
+        .collect()
+}
+
+/// Cached, filtered objects are redrawn every frame, so the targets their
+/// filters run through are wanted again a frame later. Building them fresh each
+/// time is pure churn: a client session measured 1.86 million offscreen targets
+/// created and the same number destroyed, for a pool never holding more than a
+/// few megabytes.
+#[test]
+fn filtered_cached_objects_re_use_their_filter_targets() {
+    let Some(descriptors) = descriptors() else {
+        eprintln!("no GPU adapter available; skipping");
+        return;
+    };
+    let mut backend = build_backend(descriptors);
+    let bitmap = test_bitmap(&mut backend);
+
+    // Cached objects are all different sizes, the way avatars, name plates and
+    // spell effects are. That is what made the per-frame pool expensive: a
+    // fresh pool has to build a target for every size it meets, every frame.
+    let caches: Vec<(BitmapHandle, u32, u32)> = (0..64u32)
+        .map(|i| {
+            let width = 48 + (i % 16) * 13;
+            let height = 40 + (i % 11) * 17;
+            let handle = backend
+                .create_empty_texture(
+                    NonZeroU32::new(width).expect("non-zero"),
+                    NonZeroU32::new(height).expect("non-zero"),
+                )
+                .expect("cache texture");
+            (handle, width, height)
+        })
+        .collect();
+
+    for _ in 0..WARMUP_FRAMES {
+        backend.submit_frame(
+            Color::BLACK,
+            CommandList::new(),
+            cache_entries(&bitmap, &caches),
+        );
+        backend.capture_frame().expect("capture must succeed");
+    }
+
+    let before = pool_usage();
+    for _ in 0..MEASURED_FRAMES {
+        backend.submit_frame(
+            Color::BLACK,
+            CommandList::new(),
+            cache_entries(&bitmap, &caches),
+        );
+        backend.capture_frame().expect("capture must succeed");
+    }
+    let usage = pool_usage() - before;
+
+    println!(
+        "\n64 filtered cached objects: {} targets taken over {MEASURED_FRAMES} frames, \
+         {} built ({:.1} per frame)",
+        usage.takes,
+        usage.builds,
+        usage.builds as f64 / MEASURED_FRAMES as f64
+    );
+
+    assert!(
+        usage.builds * 4 < usage.takes,
+        "{} of {} filter targets had to be built - they are not surviving between frames",
+        usage.builds,
+        usage.takes
     );
 }

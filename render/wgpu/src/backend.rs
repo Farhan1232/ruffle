@@ -699,16 +699,23 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
 
         self.active_frame
             .submit_for_target(&self.descriptors, &self.target, frame_output);
-        self.offscreen_texture_pool = TexturePool::new();
 
-        // The offscreen pool above is rebuilt every frame, but the surface
-        // pool lives for the whole session, so it grows to the busiest frame
-        // it has ever drawn and stays there. Give it the chance to let go of
-        // targets it has stopped needing - rarely, because the point is to
-        // keep re-using them, not to churn.
+        // Both pools live for the whole session, so they grow to the busiest
+        // frame they have ever drawn and stay there. Give them the chance to
+        // let go of targets they have stopped needing - rarely, because the
+        // point is to keep re-using them, not to churn.
+        //
+        // The offscreen pool used to be thrown away and rebuilt every frame,
+        // which bounded it but meant it re-used nothing: a client session
+        // measured 1.86 million offscreen targets created and 1.86 million
+        // destroyed, 124 GiB of allocation, for a pool that was never holding
+        // more than a few megabytes at a time. Trimming bounds it just as well
+        // and lets a cached object's filter targets survive to the next frame,
+        // which is where they are wanted again a sixtieth of a second later.
         self.frames_since_pool_trim += 1;
         if self.frames_since_pool_trim >= FRAMES_BETWEEN_POOL_TRIMS {
             self.frames_since_pool_trim = 0;
+            self.offscreen_texture_pool.trim_idle();
             self.texture_pool.trim_idle();
         }
     }
