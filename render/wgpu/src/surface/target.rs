@@ -258,6 +258,9 @@ pub struct CommandTarget {
     whole_frame_bind_group: OnceCell<(wgpu::Buffer, wgpu::BindGroup)>,
     color_needs_clear: OnceCell<bool>,
     render_target_mode: RenderTargetMode,
+    /// The colour attachment's own size, which is `size` unless this target is
+    /// drawing into a texture kept from a larger frame.
+    attachment_size: wgpu::Extent3d,
 }
 
 impl CommandTarget {
@@ -271,13 +274,24 @@ impl CommandTarget {
         encoder: &mut wgpu::CommandEncoder,
     ) -> Self {
         let size = rect.extent();
+        // What is really being drawn into. A `cacheAsBitmap` texture may be
+        // bigger than the picture inside it, so that an object whose bounds
+        // breathe by a pixel or two keeps the texture it has; when it is, the
+        // passes are held to the picture's own rectangle at the top-left corner
+        // and the rest of the texture is never drawn to, sampled, or filtered.
+        let attachment_size = match &render_target_mode {
+            RenderTargetMode::ExistingWithColor(texture, _) => texture.size(),
+            _ => size,
+        };
         let globals = pool.get_globals(descriptors, size.width, size.height);
 
         let mut make_pooled_frame_buffer = || {
             FrameBuffer::new(
                 descriptors,
                 sample_count,
-                size,
+                // A multisampled attachment has to be exactly as big as the
+                // texture it resolves into.
+                attachment_size,
                 format,
                 if sample_count > 1 {
                     wgpu::TextureUsages::RENDER_ATTACHMENT
@@ -344,6 +358,7 @@ impl CommandTarget {
                     &globals,
                     sample_count,
                     encoder,
+                    None,
                 );
             } else {
                 encoder.copy_texture_to_texture(
@@ -367,11 +382,43 @@ impl CommandTarget {
             whole_frame_bind_group,
             color_needs_clear: OnceCell::new(),
             render_target_mode,
+            attachment_size,
         }
     }
 
     pub fn rect(&self) -> TargetRect {
         self.rect
+    }
+
+    /// Holds a pass to the part of the attachment this target actually covers.
+    ///
+    /// A no-op unless the colour attachment is bigger than the target - which
+    /// only happens for a `cacheAsBitmap` texture kept across a small change of
+    /// size. The viewport maps the whole of clip space onto the target's own
+    /// rectangle, so the picture lands at the same pixels it would have landed
+    /// at in a texture of its own size, and the scissor makes sure nothing can
+    /// be written outside it.
+    pub fn apply_viewport(&self, render_pass: &mut wgpu::RenderPass<'_>) {
+        if self.attachment_size.width == self.size.width
+            && self.attachment_size.height == self.size.height
+        {
+            return;
+        }
+        render_pass.set_viewport(
+            0.0,
+            0.0,
+            self.size.width as f32,
+            self.size.height as f32,
+            0.0,
+            1.0,
+        );
+        render_pass.set_scissor_rect(0, 0, self.size.width, self.size.height);
+    }
+
+    /// Whether the colour attachment is bigger than what this target draws.
+    pub fn has_spare_capacity(&self) -> bool {
+        self.attachment_size.width != self.size.width
+            || self.attachment_size.height != self.size.height
     }
 
     pub fn width(&self) -> u32 {
@@ -439,9 +486,12 @@ impl CommandTarget {
         pool: &mut TexturePool,
     ) -> Option<wgpu::RenderPassDepthStencilAttachment<'_>> {
         let new_buffer = self.depth.get().is_none();
-        let stencil = self
-            .depth
-            .get_or_init(|| StencilBuffer::new(descriptors, self.sample_count, self.size, pool));
+        // Every attachment in a render pass has to be the same size, and the
+        // colour attachment is the whole texture even when only part of it is
+        // being drawn into.
+        let stencil = self.depth.get_or_init(|| {
+            StencilBuffer::new(descriptors, self.sample_count, self.attachment_size, pool)
+        });
         Some(wgpu::RenderPassDepthStencilAttachment {
             view: stencil.view(),
             depth_ops: None,

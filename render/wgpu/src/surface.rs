@@ -119,6 +119,7 @@ impl Surface {
             target.globals(),
             1,
             draw_encoder,
+            None,
         );
     }
 
@@ -212,6 +213,8 @@ impl Surface {
                         },
                     );
                     render_pass.set_bind_group(0, target.globals().bind_group(), &[]);
+                    // A cache texture may be bigger than the picture in it.
+                    target.apply_viewport(&mut render_pass);
                     let mut renderer = CommandRenderer::new(
                         &self.pipelines,
                         descriptors,
@@ -425,6 +428,8 @@ impl Surface {
                             ..Default::default()
                         });
                     render_pass.set_bind_group(0, target.globals().bind_group(), &[]);
+                    // A cache texture may be bigger than the picture in it.
+                    target.apply_viewport(&mut render_pass);
 
                     if needs_stencil {
                         match mask_state {

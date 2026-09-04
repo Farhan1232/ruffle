@@ -79,6 +79,8 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     viewport_scale_factor: f64,
     texture_pool: TexturePool,
     offscreen_texture_pool: TexturePool,
+    /// Released `cacheAsBitmap` textures, waiting to be asked for again.
+    cache_texture_pool: Arc<std::sync::Mutex<crate::cache_pool::CacheTexturePool>>,
     /// Frames drawn since the surface pool was last given the chance to
     /// release targets it no longer needs.
     last_pool_trim: std::time::Instant,
@@ -290,6 +292,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             viewport_scale_factor: 1.0,
             texture_pool: TexturePool::new(),
             offscreen_texture_pool: TexturePool::new_offscreen(),
+            cache_texture_pool: crate::cache_pool::CacheTexturePool::new(),
             last_pool_trim: std::time::Instant::now(),
             offscreen_buffer_pool: Arc::new(offscreen_buffer_pool),
             dynamic_transforms: transforms,
@@ -599,11 +602,18 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         let phase_start = std::time::Instant::now();
         for entry in cache_entries {
             let texture = as_texture(&entry.handle);
+            // The picture, not the texture. A cache keeps its texture while the
+            // picture inside it only changes by a few pixels, so the texture can
+            // be the larger of the two; everything here is sized on the picture
+            // so that the spare capacity is never drawn to, never filtered and
+            // never sampled.
+            let logical_width = entry.logical_width.clamp(1, texture.texture.width());
+            let logical_height = entry.logical_height.clamp(1, texture.texture.height());
             let surface = Surface::new(
                 &self.descriptors,
                 self.surface.quality(),
-                texture.texture.width(),
-                texture.texture.height(),
+                logical_width,
+                logical_height,
                 wgpu::TextureFormat::Rgba8Unorm,
             );
             if entry.filters.is_empty() {
@@ -632,20 +642,41 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 let mut scope = self
                     .profiler
                     .scope("Filters", &mut self.active_frame.command_encoder);
-                // We're relying on there being no impotent filters here,
-                // so that we can safely start by using the actual CAB texture.
-                // It's guaranteed that at least one filter would have used it and moved the target to something else,
-                // letting us safely copy back to it later.
+                let clear = wgpu::Color {
+                    r: f64::from(entry.clear.r) / 255.0,
+                    g: f64::from(entry.clear.g) / 255.0,
+                    b: f64::from(entry.clear.b) / 255.0,
+                    a: f64::from(entry.clear.a) / 255.0,
+                };
+                // A filter must never be handed a rectangle of a larger
+                // texture. The filters bind more than one texture to a pass -
+                // a glow samples the source and the blurred copy of it with the
+                // same coordinates, and a displacement map samples by
+                // coordinate rather than by neighbourhood - and those textures
+                // are targets of their own, exactly the size of the picture. A
+                // source that was a sub-rectangle of a bigger texture would put
+                // the two sets of coordinates on different scales, which is the
+                // mistake that broke `displacement_map` the first time this was
+                // tried.
+                //
+                // So when the cache's texture has spare capacity, the picture is
+                // drawn into a target of exactly its own size and filtered from
+                // there. It costs nothing: the filtered result was always going
+                // to be copied back into the cache texture, and this is the same
+                // copy. Without spare capacity the path is exactly what it was.
+                let spare_capacity = texture.texture.width() != logical_width
+                    || texture.texture.height() != logical_height;
+                let render_target_mode = if spare_capacity {
+                    RenderTargetMode::FreshWithColor(clear)
+                } else {
+                    // We're relying on there being no impotent filters here,
+                    // so that we can safely start by using the actual CAB texture.
+                    // It's guaranteed that at least one filter would have used it and moved the target to something else,
+                    // letting us safely copy back to it later.
+                    RenderTargetMode::ExistingWithColor(texture.texture.clone(), clear)
+                };
                 let mut target = surface.draw_commands(
-                    RenderTargetMode::ExistingWithColor(
-                        texture.texture.clone(),
-                        wgpu::Color {
-                            r: f64::from(entry.clear.r) / 255.0,
-                            g: f64::from(entry.clear.g) / 255.0,
-                            b: f64::from(entry.clear.b) / 255.0,
-                            a: f64::from(entry.clear.a) / 255.0,
-                        },
-                    ),
+                    render_target_mode,
                     &self.descriptors,
                     &self.meshes,
                     entry.commands,
@@ -674,6 +705,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     target.globals(),
                     target.color_texture().sample_count(),
                     &mut scope.scope("Copy filtered to CAB"),
+                    Some((logical_width, logical_height)),
                 );
             }
             // Periodically flush GPU work to prevent OOM when many cache entries
@@ -733,6 +765,9 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             self.last_pool_trim = std::time::Instant::now();
             self.offscreen_texture_pool.trim_idle();
             self.texture_pool.trim_idle();
+            if let Ok(mut pool) = self.cache_texture_pool.lock() {
+                pool.trim_idle();
+            }
         }
     }
 
@@ -1189,6 +1224,23 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             depth_or_array_layers: 1,
         };
 
+        // A cache texture that has just been released is very often exactly
+        // the one this request wants: an animating avatar asks for the same
+        // handful of sizes over and over. Recycling one is safe because every
+        // redraw clears the whole texture before drawing into it - see
+        // `cache_pool` for the argument in full.
+        let pooling = crate::tuning::cache_pool_enabled();
+        if pooling
+            && let Ok(mut pool) = self.cache_texture_pool.lock()
+            && let Some(recycled) = pool.take(width, height)
+        {
+            drop(pool);
+            return Ok(BitmapHandle(Arc::new(Texture::recycled(
+                recycled,
+                self.cache_texture_pool.clone(),
+            ))));
+        }
+
         let texture_label = create_debug_label!("Bitmap");
         let texture = self
             .descriptors
@@ -1206,7 +1258,11 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     | wgpu::TextureUsages::RENDER_ATTACHMENT
                     | wgpu::TextureUsages::COPY_SRC,
             });
-        Ok(BitmapHandle(Arc::new(Texture::new(texture))))
+        Ok(BitmapHandle(Arc::new(if pooling {
+            Texture::new_pooled(texture, self.cache_texture_pool.clone())
+        } else {
+            Texture::new(texture)
+        })))
     }
 
     fn resolve_sync_handle(

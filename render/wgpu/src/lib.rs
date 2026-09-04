@@ -32,6 +32,7 @@ pub mod utils;
 mod bind_cache;
 mod bitmaps;
 mod bounds;
+pub mod cache_pool;
 mod context3d;
 mod globals;
 mod pipelines;
@@ -272,11 +273,17 @@ impl QueueSyncHandle {
 #[derive(Debug)]
 pub struct Texture {
     pub(crate) texture: wgpu::Texture,
-    repeating_linear: OnceCell<BitmapBinds>,
-    repeating_nearest: OnceCell<BitmapBinds>,
-    clamped_linear: OnceCell<BitmapBinds>,
-    clamped_nearest: OnceCell<BitmapBinds>,
+    pub(crate) repeating_linear: OnceCell<BitmapBinds>,
+    pub(crate) repeating_nearest: OnceCell<BitmapBinds>,
+    pub(crate) clamped_linear: OnceCell<BitmapBinds>,
+    pub(crate) clamped_nearest: OnceCell<BitmapBinds>,
     copy_count: Cell<u8>,
+    /// The pool to give this texture back to when its owner lets it go.
+    ///
+    /// Only `cacheAsBitmap` textures have one: they are renderer-owned,
+    /// disposable, and fully cleared before every redraw. A bitmap registered
+    /// from pixels is not recycled, because its content is its identity.
+    pub(crate) cache_pool: Option<Arc<std::sync::Mutex<crate::cache_pool::CacheTexturePool>>>,
 }
 
 /// Bytes of texture memory Ruffle itself has asked for and not yet released
@@ -285,6 +292,16 @@ pub struct Texture {
 /// memory, so this is counted here for the memory report.
 static TEXTURE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static TEXTURE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Every texture ever created and dropped, and the bytes they came to.
+///
+/// The live numbers above say what is held now; these say how much traffic it
+/// took to get there. The client's 43-minute session held about 112 MB of
+/// texture at the end and had allocated 207 GiB to do it, and it is the second
+/// number that a driver's allocator, its fragmentation and its deferred frees
+/// actually see.
+static TEXTURES_CREATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TEXTURES_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TEXTURE_BYTES_CREATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// What a frame costs the renderer in work rather than in memory.
 ///
@@ -666,6 +683,7 @@ pub mod tuning {
 
     static BLEND_PAGES: AtomicBool = AtomicBool::new(true);
     static BLEND_BATCHING: AtomicBool = AtomicBool::new(true);
+    static CACHE_POOL: AtomicBool = AtomicBool::new(true);
 
     /// Whether blended groups share pages instead of each taking a target.
     pub fn blend_pages_enabled() -> bool {
@@ -685,6 +703,17 @@ pub mod tuning {
     pub fn set_blend_batching_enabled(enabled: bool) {
         BLEND_BATCHING.store(enabled, Ordering::Relaxed);
     }
+
+    /// Whether released `cacheAsBitmap` textures are recycled instead of
+    /// destroyed. Off, this is exactly the phase 1 behaviour, which is how the
+    /// two are measured against each other.
+    pub fn cache_pool_enabled() -> bool {
+        CACHE_POOL.load(Ordering::Relaxed)
+    }
+
+    pub fn set_cache_pool_enabled(enabled: bool) {
+        CACHE_POOL.store(enabled, Ordering::Relaxed);
+    }
 }
 
 /// Approximate memory of a texture: its pixels at the format's block size.
@@ -699,14 +728,31 @@ pub(crate) fn texture_bytes(texture: &wgpu::Texture) -> usize {
 
 pub(crate) fn track_texture_created(texture: &wgpu::Texture) {
     use std::sync::atomic::Ordering;
-    TEXTURE_BYTES.fetch_add(texture_bytes(texture), Ordering::Relaxed);
+    let bytes = texture_bytes(texture);
+    TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
     TEXTURE_COUNT.fetch_add(1, Ordering::Relaxed);
+    TEXTURES_CREATED.fetch_add(1, Ordering::Relaxed);
+    TEXTURE_BYTES_CREATED.fetch_add(bytes as u64, Ordering::Relaxed);
 }
 
 pub(crate) fn track_texture_dropped(texture: &wgpu::Texture) {
     use std::sync::atomic::Ordering;
     TEXTURE_BYTES.fetch_sub(texture_bytes(texture), Ordering::Relaxed);
     TEXTURE_COUNT.fetch_sub(1, Ordering::Relaxed);
+    TEXTURES_DROPPED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `(created, dropped, bytes created)` since the process started.
+///
+/// Cumulative allocation traffic, not memory in use: subtract two readings to
+/// get the churn of the span between them.
+pub fn texture_churn() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        TEXTURES_CREATED.load(Ordering::Relaxed),
+        TEXTURES_DROPPED.load(Ordering::Relaxed),
+        TEXTURE_BYTES_CREATED.load(Ordering::Relaxed),
+    )
 }
 
 /// `(textures alive, their bytes)` as tracked by Ruffle.
@@ -720,6 +766,12 @@ pub fn tracked_texture_totals() -> (usize, usize) {
 
 impl Drop for Texture {
     fn drop(&mut self) {
+        // A pooled cache texture is still allocated after this, so it stays in
+        // the live accounting; the pool subtracts it when it really destroys
+        // it.
+        if crate::cache_pool::release(self) {
+            return;
+        }
         track_texture_dropped(&self.texture);
     }
 }
@@ -734,6 +786,43 @@ impl Texture {
             clamped_linear: Default::default(),
             clamped_nearest: Default::default(),
             copy_count: Cell::new(0),
+            cache_pool: None,
+        }
+    }
+
+    /// A cache texture that goes back to `pool` when its owner releases it.
+    ///
+    /// `recycled` is a texture the pool already had, with the bind groups that
+    /// name it; they are still valid, since it is the same texture.
+    pub(crate) fn recycled(
+        recycled: crate::cache_pool::Recycled,
+        pool: Arc<std::sync::Mutex<crate::cache_pool::CacheTexturePool>>,
+    ) -> Self {
+        Self {
+            texture: recycled.texture,
+            repeating_linear: recycled.repeating_linear,
+            repeating_nearest: recycled.repeating_nearest,
+            clamped_linear: recycled.clamped_linear,
+            clamped_nearest: recycled.clamped_nearest,
+            copy_count: Cell::new(0),
+            cache_pool: Some(pool),
+        }
+    }
+
+    /// A freshly allocated cache texture, which will join `pool` when released.
+    pub(crate) fn new_pooled(
+        texture: wgpu::Texture,
+        pool: Arc<std::sync::Mutex<crate::cache_pool::CacheTexturePool>>,
+    ) -> Self {
+        track_texture_created(&texture);
+        Self {
+            texture,
+            repeating_linear: Default::default(),
+            repeating_nearest: Default::default(),
+            clamped_linear: Default::default(),
+            clamped_nearest: Default::default(),
+            copy_count: Cell::new(0),
+            cache_pool: Some(pool),
         }
     }
 

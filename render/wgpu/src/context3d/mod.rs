@@ -117,6 +117,7 @@ impl WgpuContext3D {
                 clamped_nearest: Default::default(),
                 texture: dummy_texture,
                 copy_count: Cell::new(0),
+                cache_pool: None,
             }))
         };
 
@@ -652,6 +653,7 @@ impl Context3D for WgpuContext3D {
                         clamped_linear: Default::default(),
                         clamped_nearest: Default::default(),
                         copy_count: Cell::new(0),
+                        cache_pool: None,
                     }));
                     self.front_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture {
                         texture: front_buffer_resolve_texture.unwrap(),
@@ -660,6 +662,7 @@ impl Context3D for WgpuContext3D {
                         clamped_linear: Default::default(),
                         clamped_nearest: Default::default(),
                         copy_count: Cell::new(0),
+                        cache_pool: None,
                     }));
                 } else {
                     // In non-multisample mode, we don't have a separate resolve buffer,
@@ -672,6 +675,7 @@ impl Context3D for WgpuContext3D {
                         clamped_linear: Default::default(),
                         clamped_nearest: Default::default(),
                         copy_count: Cell::new(0),
+                        cache_pool: None,
                     }));
                     self.front_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture {
                         texture: front_buffer_texture,
@@ -680,6 +684,7 @@ impl Context3D for WgpuContext3D {
                         clamped_linear: Default::default(),
                         clamped_nearest: Default::default(),
                         copy_count: Cell::new(0),
+                        cache_pool: None,
                     }));
                     self.current_texture_resolve_view = None;
                 }

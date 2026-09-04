@@ -64,6 +64,8 @@ pub use movie_clip::{MovieClip, MovieClipHandle, MovieClipWeak, Scene};
 use ruffle_render::backend::{BitmapCacheEntry, RenderBackend};
 use ruffle_render::bitmap::{BitmapInfo, PixelSnapping};
 use ruffle_render::blend::ExtendedBlendMode;
+use ruffle_render::cache_capacity::{capacity_fits, capacity_for};
+use ruffle_render::cache_stats::{CacheAllocation, CacheInvalidation};
 use ruffle_render::commands::{CommandHandler, CommandList, RenderBlendMode};
 use ruffle_render::filters::Filter;
 pub use stage::{Stage, StageAlign, StageDisplayState, StageScaleMode, WindowMode};
@@ -112,6 +114,17 @@ pub struct BitmapCache {
     /// The current contents of the cache, if any. Values are post-filters.
     bitmap: Option<std::rc::Rc<TrackedCacheBitmap>>,
 
+    /// The size of the picture inside the texture.
+    ///
+    /// The texture is at least this big and may be a little more, so that an
+    /// object whose bounds breathe by a pixel or two between frames keeps the
+    /// texture it has instead of allocating a new one every frame. This is the
+    /// size everything outside this struct is told: `bitmap()` reports it, so
+    /// the composite samples exactly this rectangle and the redraw and its
+    /// filters cover exactly this rectangle. The physical size lives on
+    /// `bitmap.info` and goes no further than the memory accounting.
+    logical: (u32, u32),
+
     /// Whether we warned that this bitmap was too large to be cached
     warned_for_oversize: bool,
 }
@@ -125,14 +138,37 @@ impl BitmapCache {
         self.matrix_a = f32::NAN;
     }
 
-    fn is_dirty(&self, other: &Matrix, source_width: u32, source_height: u32) -> bool {
-        self.matrix_a != other.a
+    /// Whether the cached picture is out of date, and why.
+    ///
+    /// The reason is what phase 2 needs to tell a cache that is working from
+    /// one that is thrashing: an object that genuinely changed shape has to be
+    /// redrawn, and an object that only moved should never have been.
+    fn is_dirty(
+        &self,
+        other: &Matrix,
+        source_width: u32,
+        source_height: u32,
+    ) -> Option<CacheInvalidation> {
+        if self.bitmap.is_none() {
+            return Some(CacheInvalidation::FirstAllocation);
+        }
+        // `make_dirty` invalidates by writing a NaN over the matrix, so a NaN
+        // here is something the cache could not see for itself - a child that
+        // moved, or a filter list that changed - rather than a real transform.
+        if self.matrix_a.is_nan() && !other.a.is_nan() {
+            return Some(CacheInvalidation::ContentDirty);
+        }
+        if self.matrix_a != other.a
             || self.matrix_b != other.b
             || self.matrix_c != other.c
             || self.matrix_d != other.d
-            || self.source_width != source_width
-            || self.source_height != source_height
-            || self.bitmap.is_none()
+        {
+            return Some(CacheInvalidation::TransformChange);
+        }
+        if self.source_width != source_width || self.source_height != source_height {
+            return Some(CacheInvalidation::SourceSizeChange);
+        }
+        None
     }
 
     /// Clears any dirtiness and ensure there's an appropriately sized texture allocated
@@ -156,36 +192,78 @@ impl BitmapCache {
         self.source_width = source_width;
         self.source_height = source_height;
         self.draw_offset = draw_offset;
-        if let Some(current) = &mut self.bitmap
-            && current.info.width == actual_width
-            && current.info.height == actual_height
+        let previous = self
+            .bitmap
+            .as_ref()
+            .map(|current| (current.info.width, current.info.height));
+        if let Some(physical) = previous
+            && capacity_fits(physical, (actual_width, actual_height))
         {
-            return; // No need to resize it
+            // The texture stays; only the picture inside it changes size.
+            let spare = u64::from(physical.0) * u64::from(physical.1)
+                - u64::from(actual_width) * u64::from(actual_height);
+            ruffle_render::cache_stats::record_texture_kept(spare);
+            self.logical = (actual_width, actual_height);
+            return;
         }
-        let acceptable_size = if swf_version > 9 {
-            let total = actual_width * actual_height;
-            actual_width < 8191 && actual_height < 8191 && total < 16777215
-        } else {
-            actual_width < 2880 && actual_height < 2880
+        let allocation_reason = match previous {
+            None => CacheAllocation::FirstAllocation,
+            Some((width, _)) if actual_width > width => CacheAllocation::WidthExceeded,
+            Some((_, height)) if actual_height > height => CacheAllocation::HeightExceeded,
+            Some(_) => CacheAllocation::Shrank,
         };
+        // Judged on the texture that would really be built, not on the picture:
+        // rounding a size up must never talk the cache into a texture it would
+        // otherwise have refused. And an object near the limit whose rounded
+        // size is over it keeps its cache at the exact size, rather than losing
+        // the cache altogether over a rounding this code chose.
+        let acceptable = |width: u32, height: u32| {
+            if swf_version > 9 {
+                let total = u64::from(width) * u64::from(height);
+                width < 8191 && height < 8191 && total < 16777215
+            } else {
+                width < 2880 && height < 2880
+            }
+        };
+        let rounded = capacity_for(actual_width, actual_height);
+        let (physical_width, physical_height) = if acceptable(rounded.0, rounded.1) {
+            rounded
+        } else {
+            (actual_width, actual_height)
+        };
+        let acceptable_size = acceptable(physical_width, physical_height);
 
         if renderer.is_offscreen_supported()
-            && let Some(actual_width) = NonZero::new(actual_width)
-            && let Some(actual_height) = NonZero::new(actual_height)
+            && let Some(physical_width) = NonZero::new(physical_width)
+            && let Some(physical_height) = NonZero::new(physical_height)
+            && actual_width > 0
+            && actual_height > 0
             && acceptable_size
         {
-            let handle = renderer.create_empty_texture(actual_width, actual_height);
+            let handle = renderer.create_empty_texture(physical_width, physical_height);
+            if handle.is_ok() {
+                ruffle_render::cache_stats::record_allocation(
+                    allocation_reason,
+                    physical_width.get(),
+                    physical_height.get(),
+                );
+            } else {
+                ruffle_render::cache_stats::record_allocation(CacheAllocation::Refused, 0, 0);
+            }
+            self.logical = (actual_width, actual_height);
             self.bitmap = handle.ok().map(|handle| {
                 std::rc::Rc::new(TrackedCacheBitmap::new(
+                    // The texture's own size, which is what it costs in memory.
                     BitmapInfo {
-                        width: actual_width.get(),
-                        height: actual_height.get(),
+                        width: physical_width.get(),
+                        height: physical_height.get(),
                         handle,
                     },
                     metrics.clone(),
                 ))
             });
         } else {
+            ruffle_render::cache_stats::record_allocation(CacheAllocation::Refused, 0, 0);
             self.bitmap = None;
         }
     }
@@ -195,10 +273,17 @@ impl BitmapCache {
     /// temporarily disabled.
     fn clear(&mut self) {
         self.bitmap = None;
+        self.logical = (0, 0);
     }
 
+    /// The cached picture: the handle, and the size of the picture rather than
+    /// of the texture holding it.
     fn bitmap(&self) -> Option<BitmapInfo> {
-        self.bitmap.as_ref().map(|bitmap| bitmap.info.clone())
+        self.bitmap.as_ref().map(|bitmap| BitmapInfo {
+            handle: bitmap.info.handle.clone(),
+            width: self.logical.0,
+            height: self.logical.1,
+        })
     }
 }
 
@@ -1049,7 +1134,8 @@ pub fn render_base<'gc>(
                     y_max: filter_rect.y_max.to_pixels().ceil() as i32,
                 };
                 let draw_offset = Point::new(filter_rect.x_min, filter_rect.y_min);
-                if cache.is_dirty(&base_transform.matrix, width, height) {
+                if let Some(reason) = cache.is_dirty(&base_transform.matrix, width, height) {
+                    ruffle_render::cache_stats::record_invalidation(reason);
                     cache.update(
                         context.renderer,
                         context.gc_context.metrics(),
@@ -1135,6 +1221,9 @@ pub fn render_base<'gc>(
                 commands: offscreen_context.commands,
                 clear: this.opaque_background().unwrap_or_default(),
                 filters: cache_info.filters,
+                // The picture's own size. The texture behind it may be larger.
+                logical_width: cache_info.bitmap.width,
+                logical_height: cache_info.bitmap.height,
             });
         }
 

@@ -23,6 +23,17 @@ pub struct BitmapCacheEntry {
     pub commands: CommandList,
     pub clear: Color,
     pub filters: Vec<Filter>,
+    /// The size of the picture inside the texture.
+    ///
+    /// The texture may be *larger* than this: a cache keeps its texture while
+    /// the picture inside it only changes by a few pixels, which is what stops
+    /// an animating avatar reallocating one every frame. See
+    /// [`crate::cache_capacity`]. Everything that redraws or filters a cache
+    /// takes its extent from here and never from the texture, which is the
+    /// whole difference between this and the padding experiment that broke
+    /// `displacement_map`.
+    pub logical_width: u32,
+    pub logical_height: u32,
 }
 
 /// GPU memory held by a render backend at one moment.

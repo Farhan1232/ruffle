@@ -369,6 +369,8 @@ fn cache_entries(
                 strength: Fixed8::ONE,
                 flags: GlowFilterFlags::from_passes(1),
             })],
+            logical_width: *width,
+            logical_height: *height,
         })
         .collect()
 }

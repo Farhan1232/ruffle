@@ -1,6 +1,6 @@
 use crate::descriptors::Descriptors;
 use crate::globals::Globals;
-use fnv::FnvHashMap;
+use fnv::{FnvHashMap, FnvHashSet};
 use std::fmt::{Debug, Formatter};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,6 +48,154 @@ pub fn pool_usage() -> PoolUsage {
         builds: POOL_BUILDS.load(Ordering::Relaxed),
         pixels: POOL_PIXELS.load(Ordering::Relaxed),
     }
+}
+
+/// Which of the two texture pools a measurement belongs to.
+///
+/// They behave completely differently and have to be read apart: the main pool
+/// serves a handful of size classes and reuses nearly everything, while the
+/// offscreen pool's sizes follow the content and it is the one that built
+/// 758,880 textures in the client's session.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PoolKind {
+    /// Targets a frame is composed from.
+    Main,
+    /// Scratch space for filters and offscreen draws.
+    Offscreen,
+}
+
+/// Why a request could not be served from the free list.
+///
+/// The first three are about the key: this pool is a map from an exact
+/// `(size, usage, format, sample_count)` to a free list, so a request whose key
+/// is not in the map has to build, and *which part* of the key was new is the
+/// whole question. The rest are about a key that exists.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PoolMiss {
+    /// A size this pool has never been asked for.
+    NewSizeClass,
+    /// A size it has been asked for, at a format it has not.
+    FormatMismatch,
+    /// A size and format it has been asked for, at another sample count.
+    SampleCountMismatch,
+    /// A size, format and sample count it has been asked for, with other usage
+    /// flags.
+    UsageMismatch,
+    /// A size it held and gave up to stay inside its idle budget, asked for
+    /// again. This is the category that says the budget is too small rather
+    /// than that the content is too varied.
+    EvictedByBudget,
+    /// The key was registered and every texture under it was already lent out.
+    /// This one is not waste - the frame really is using them all at once.
+    FreeListEmpty,
+}
+
+pub const POOL_MISS_NAMES: &[&str] = &[
+    "new_size_class",
+    "format_mismatch",
+    "sample_count_mismatch",
+    "usage_mismatch",
+    "evicted_by_budget",
+    "free_list_empty",
+];
+
+const MISS_REASONS: usize = 6;
+const POOL_KINDS: usize = 2;
+
+#[expect(clippy::declare_interior_mutable_const)]
+const ZERO: AtomicU64 = AtomicU64::new(0);
+static POOL_HITS: [AtomicU64; POOL_KINDS] = [ZERO; POOL_KINDS];
+#[expect(clippy::declare_interior_mutable_const)]
+const ZERO_ROW: [AtomicU64; MISS_REASONS] = [ZERO; MISS_REASONS];
+static POOL_MISSES: [[AtomicU64; MISS_REASONS]; POOL_KINDS] = [ZERO_ROW; POOL_KINDS];
+static POOL_MISS_BYTES: [[AtomicU64; MISS_REASONS]; POOL_KINDS] = [ZERO_ROW; POOL_KINDS];
+static POOL_EVICTIONS: [AtomicU64; POOL_KINDS] = [ZERO; POOL_KINDS];
+static POOL_EVICTED_BYTES: [AtomicU64; POOL_KINDS] = [ZERO; POOL_KINDS];
+
+/// What one pool has done so far. Subtract two readings to measure a stretch.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PoolTelemetry {
+    /// Requests served from a free list.
+    pub hits: u64,
+    /// Requests that had to build, indexed by [`PoolMiss`].
+    pub misses: Vec<u64>,
+    /// Bytes those builds came to, indexed the same way.
+    pub miss_bytes: Vec<u64>,
+    /// Idle textures given up to stay inside the budget, and their bytes.
+    pub evictions: u64,
+    pub evicted_bytes: u64,
+    /// The sizes asked for most often, biggest first: `(width, height,
+    /// requests, builds)`. Published when the pool is trimmed.
+    pub top_sizes: Vec<(u32, u32, u64, u64)>,
+    /// How many distinct sizes the pool is holding keys for.
+    pub live_size_classes: usize,
+    /// Distinct sizes met since the process started.
+    pub size_classes_seen: usize,
+}
+
+impl PoolTelemetry {
+    pub fn misses_total(&self) -> u64 {
+        self.misses.iter().sum()
+    }
+}
+
+/// The published size histograms, one per pool kind. Written when a pool is
+/// trimmed rather than on every request, so that taking a texture stays a
+/// couple of atomic adds.
+static SIZE_REPORTS: Mutex<Option<[PoolSizeReport; POOL_KINDS]>> = Mutex::new(None);
+
+#[derive(Clone, Debug, Default)]
+struct PoolSizeReport {
+    top_sizes: Vec<(u32, u32, u64, u64)>,
+    live_size_classes: usize,
+    size_classes_seen: usize,
+}
+
+/// What one of the texture pools has done so far.
+pub fn pool_telemetry(kind: PoolKind) -> PoolTelemetry {
+    let index = kind as usize;
+    let report = SIZE_REPORTS
+        .lock()
+        .ok()
+        .and_then(|reports| reports.as_ref().map(|reports| reports[index].clone()))
+        .unwrap_or_default();
+    PoolTelemetry {
+        hits: POOL_HITS[index].load(Ordering::Relaxed),
+        misses: POOL_MISSES[index]
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .collect(),
+        miss_bytes: POOL_MISS_BYTES[index]
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .collect(),
+        evictions: POOL_EVICTIONS[index].load(Ordering::Relaxed),
+        evicted_bytes: POOL_EVICTED_BYTES[index].load(Ordering::Relaxed),
+        top_sizes: report.top_sizes,
+        live_size_classes: report.live_size_classes,
+        size_classes_seen: report.size_classes_seen,
+    }
+}
+
+/// What the offscreen pool keeps in idle scratch space.
+///
+/// Measured rather than guessed. A room of a hundred filtered, animating
+/// objects asks this pool for a few hundred targets a frame across a couple of
+/// hundred live sizes, and at 64 MiB it spent between a quarter and a half of
+/// its misses on sizes it had held and given up moments earlier - it was
+/// evicting what the next frame wanted. The sweep in
+/// `render/wgpu/tests/cache_churn.rs` is what settled the figure;
+/// `RUFFLE_OFFSCREEN_POOL_MB` overrides it so the same build can be measured
+/// both ways.
+fn offscreen_idle_budget() -> usize {
+    const DEFAULT_MB: usize = 192;
+    std::env::var("RUFFLE_OFFSCREEN_POOL_MB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|mb| *mb > 0)
+        .unwrap_or(DEFAULT_MB)
+        * 1024
+        * 1024
 }
 
 type PoolInner<T> = Mutex<PoolState<T>>;
@@ -195,6 +343,7 @@ impl TexturePool {
             .retain(|_, size_pool| !size_pool.pool.trim_idle());
         self.enforce_idle_budget();
         self.trim_globals();
+        self.publish_size_report();
     }
 
     /// Gives up the sizes least recently asked for until what is held idle fits
@@ -218,11 +367,23 @@ impl TexturePool {
                 )
             })
             .collect();
+        let index = self.kind as usize;
         for key in sizes_over_budget(idle, self.idle_budget) {
             if let Some(size_pool) = self.pools.get_mut(&key) {
+                let given_up = size_pool.pool.idle_len();
                 size_pool.pool.release_idle();
+                POOL_EVICTIONS[index].fetch_add(given_up as u64, Ordering::Relaxed);
+                POOL_EVICTED_BYTES[index]
+                    .fetch_add((given_up * key.bytes()) as u64, Ordering::Relaxed);
                 if !size_pool.pool.is_borrowed() {
                     self.pools.remove(&key);
+                    // Remembered so that asking for this size again is
+                    // reported as the budget biting rather than as a size the
+                    // content had never used.
+                    if self.evicted.len() >= 16_384 {
+                        self.evicted.clear();
+                    }
+                    self.evicted.insert(key);
                 }
             }
         }
@@ -269,6 +430,16 @@ pub struct TexturePool {
     clock: u64,
     /// The most this pool will keep in idle targets.
     idle_budget: usize,
+    /// Which pool this is, so the two can be measured apart.
+    kind: PoolKind,
+    /// Every size this pool has been asked for, with how many requests and how
+    /// many builds it took. This is what says whether the content asks for a
+    /// handful of sizes over and over or thousands of nearly identical ones.
+    size_history: FnvHashMap<(u32, u32), (u64, u64)>,
+    /// Keys this pool gave up to stay inside its budget. A request for one of
+    /// these is the budget's fault rather than the content's, and the two want
+    /// opposite fixes.
+    evicted: FnvHashSet<TextureKey>,
 }
 
 impl TexturePool {
@@ -293,15 +464,22 @@ impl TexturePool {
     /// megabytes; the budget is set an order of magnitude above that, and the
     /// sizes given up when it bites are the ones least recently wanted.
     pub fn new_offscreen() -> Self {
-        Self::with_idle_budget(64 * 1024 * 1024)
+        Self::with_kind(offscreen_idle_budget(), PoolKind::Offscreen)
     }
 
     fn with_idle_budget(idle_budget: usize) -> Self {
+        Self::with_kind(idle_budget, PoolKind::Main)
+    }
+
+    fn with_kind(idle_budget: usize, kind: PoolKind) -> Self {
         Self {
             pools: Default::default(),
             globals_cache: Default::default(),
             clock: 0,
             idle_budget,
+            kind,
+            size_history: Default::default(),
+            evicted: Default::default(),
         }
     }
 
@@ -321,6 +499,9 @@ impl TexturePool {
         };
         self.clock += 1;
         let clock = self.clock;
+        // Classified before the entry is made, because the answer depends on
+        // what the map held when the request arrived.
+        let miss_reason = self.classify_miss(&key);
         let mut fresh_key = false;
         let size_pool = self.pools.entry(key).or_insert_with(|| {
             fresh_key = true;
@@ -352,7 +533,9 @@ impl TexturePool {
             }
         });
         size_pool.last_used = clock;
+        let served_from_free_list = size_pool.pool.idle_len() > 0;
         let entry = size_pool.pool.take(descriptors, AlwaysCompatible);
+        self.record_request(&key, miss_reason, served_from_free_list);
         if fresh_key {
             self.enforce_idle_budget();
         }
@@ -362,6 +545,95 @@ impl TexturePool {
             Ordering::Relaxed,
         );
         entry
+    }
+
+    /// Why a request for `key` cannot be served from a free list, if it
+    /// cannot. `None` means the key is registered and might have one.
+    fn classify_miss(&self, key: &TextureKey) -> Option<PoolMiss> {
+        if self.pools.contains_key(key) {
+            return None;
+        }
+        if self.evicted.contains(key) {
+            return Some(PoolMiss::EvictedByBudget);
+        }
+        // Which part of the key is the new one. Checked from the most specific
+        // outwards, so a request that differs only in usage is not reported as
+        // a whole new size.
+        let mut size_seen = false;
+        let mut format_seen = false;
+        let mut samples_seen = false;
+        for other in self.pools.keys() {
+            if other.size != key.size {
+                continue;
+            }
+            size_seen = true;
+            if other.format != key.format {
+                continue;
+            }
+            format_seen = true;
+            if other.sample_count != key.sample_count {
+                continue;
+            }
+            samples_seen = true;
+        }
+        Some(if samples_seen {
+            PoolMiss::UsageMismatch
+        } else if format_seen {
+            PoolMiss::SampleCountMismatch
+        } else if size_seen {
+            PoolMiss::FormatMismatch
+        } else {
+            PoolMiss::NewSizeClass
+        })
+    }
+
+    /// Records one request against this pool's counters and size history.
+    fn record_request(
+        &mut self,
+        key: &TextureKey,
+        miss_reason: Option<PoolMiss>,
+        served_from_free_list: bool,
+    ) {
+        let index = self.kind as usize;
+        let built = !served_from_free_list;
+        let entry = self
+            .size_history
+            .entry((key.size.width, key.size.height))
+            .or_insert((0, 0));
+        entry.0 += 1;
+        if built {
+            entry.1 += 1;
+        }
+        if !built {
+            POOL_HITS[index].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        // A registered key whose free list happened to be empty is a different
+        // thing from a key that was never there.
+        let reason = miss_reason.unwrap_or(PoolMiss::FreeListEmpty);
+        POOL_MISSES[index][reason as usize].fetch_add(1, Ordering::Relaxed);
+        POOL_MISS_BYTES[index][reason as usize].fetch_add(key.bytes() as u64, Ordering::Relaxed);
+    }
+
+    /// Publishes the size histogram so it can be read from outside without
+    /// locking anything on the path a frame takes.
+    fn publish_size_report(&self) {
+        let mut sizes: Vec<(u32, u32, u64, u64)> = self
+            .size_history
+            .iter()
+            .map(|((width, height), (requests, builds))| (*width, *height, *requests, *builds))
+            .collect();
+        sizes.sort_unstable_by_key(|(_, _, requests, _)| std::cmp::Reverse(*requests));
+        sizes.truncate(24);
+        let report = PoolSizeReport {
+            top_sizes: sizes,
+            live_size_classes: self.pools.len(),
+            size_classes_seen: self.size_history.len(),
+        };
+        if let Ok(mut reports) = SIZE_REPORTS.lock() {
+            let reports = reports.get_or_insert_with(Default::default);
+            reports[self.kind as usize] = report;
+        }
     }
 
     pub fn get_globals(

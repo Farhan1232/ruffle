@@ -20,6 +20,7 @@
 
 use ruffle_render::backend::{BitmapCacheEntry, RenderBackend, ViewportDimensions};
 use ruffle_render::bitmap::{Bitmap, BitmapFormat, BitmapHandle, PixelRegion, PixelSnapping};
+use ruffle_render::cache_capacity::{capacity_fits, capacity_for};
 use ruffle_render::commands::{CommandHandler, CommandList, RenderBlendMode};
 use ruffle_render::filters::Filter;
 use ruffle_render::matrix::Matrix;
@@ -27,9 +28,11 @@ use ruffle_render::transform::Transform;
 use ruffle_render_wgpu::backend::{
     WgpuRenderBackend, create_wgpu_instance, request_adapter_and_device,
 };
-use ruffle_render_wgpu::buffer_pool::pool_usage;
+use ruffle_render_wgpu::buffer_pool::{PoolKind, pool_telemetry, pool_usage};
+use ruffle_render_wgpu::cache_pool::cache_pool_counters;
 use ruffle_render_wgpu::descriptors::Descriptors;
 use ruffle_render_wgpu::target::TextureTarget;
+use ruffle_render_wgpu::texture_churn;
 use ruffle_render_wgpu::{render_stats, tracked_texture_totals, wgpu};
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -176,48 +179,112 @@ fn scene(bitmap: &BitmapHandle, phase: Phase, frame: usize) -> CommandList {
 
 /// The filtered `cacheAsBitmap` objects the filter phase redraws, which is what
 /// exercises the offscreen pool alongside the pages.
-fn cache_entries(
-    bitmap: &BitmapHandle,
-    caches: &[(BitmapHandle, u32, u32)],
-    phase: Phase,
-    frame: usize,
-) -> Vec<BitmapCacheEntry> {
-    if phase != Phase::Filtered {
-        return vec![];
-    }
-    caches
-        .iter()
-        .enumerate()
-        .map(|(i, (handle, width, height))| BitmapCacheEntry {
-            handle: handle.clone(),
-            commands: {
-                let mut commands = CommandList::new();
-                commands.render_bitmap(
-                    bitmap.clone(),
-                    Transform {
-                        matrix: Matrix::rotate(((i + frame) as f32) * 0.03),
-                        color_transform: Default::default(),
-                        perspective_projection: None,
-                    },
-                    false,
-                    PixelSnapping::Never,
-                    PixelRegion::for_whole_size(*width, *height),
-                );
-                commands
-            },
-            clear: Color::from_rgba(0),
-            filters: vec![Filter::GlowFilter(GlowFilter {
-                color: Color::WHITE,
-                blur_x: Fixed16::from_f32(4.0),
-                blur_y: Fixed16::from_f32(4.0),
-                strength: Fixed8::ONE,
-                flags: GlowFilterFlags::from_passes(1),
-            })],
-        })
-        .collect()
-}
 
 /// What one trip round the cycle cost.
+/// `(allocated, reserved, blocks)` as the graphics allocator sees it.
+fn allocator_report(backend: &WgpuRenderBackend<TextureTarget>) -> (u64, u64, usize) {
+    backend
+        .descriptors()
+        .device
+        .generate_allocator_report()
+        .map(|report| {
+            (
+                report.total_allocated_bytes,
+                report.total_reserved_bytes,
+                report.blocks.len(),
+            )
+        })
+        .unwrap_or_default()
+}
+
+/// Cached display objects whose picture changes size every frame.
+///
+/// Each one keeps its texture while the capacity policy says the picture still
+/// fits, and allocates a new one when it does not - which is exactly what
+/// `BitmapCache::update` does, through the same shared policy.
+struct BreathingCaches {
+    actors: Vec<Option<(BitmapHandle, (u32, u32))>>,
+    built: u64,
+}
+
+impl BreathingCaches {
+    fn new(count: usize) -> Self {
+        Self {
+            actors: vec![None; count],
+            built: 0,
+        }
+    }
+
+    /// The picture's size this frame: a base per actor, a few pixels of
+    /// breathing out of phase with its neighbours, and a step every so often
+    /// for an equipment change.
+    fn logical(index: usize, frame: usize) -> (u32, u32) {
+        let base = (40 + (index as u32 % 13) * 11, 36 + (index as u32 % 9) * 15);
+        let phase = frame + index * 7;
+        let equipment = ((frame / 200 + index) % 3) as u32 * 9;
+        (
+            base.0 + [0u32, 4, 2, 6, 0, 3][phase % 6] + equipment,
+            base.1 + [0u32, 2, 1, 3, 2, 0][(phase + index) % 6] + equipment,
+        )
+    }
+
+    fn entries(
+        &mut self,
+        backend: &mut WgpuRenderBackend<TextureTarget>,
+        bitmap: &BitmapHandle,
+        frame: usize,
+    ) -> Vec<BitmapCacheEntry> {
+        let mut entries = Vec::with_capacity(self.actors.len());
+        for index in 0..self.actors.len() {
+            let logical = Self::logical(index, frame);
+            let keep = matches!(&self.actors[index], Some((_, physical)) if capacity_fits(*physical, logical));
+            if !keep {
+                let physical = capacity_for(logical.0, logical.1);
+                let handle = backend
+                    .create_empty_texture(
+                        NonZeroU32::new(physical.0).expect("non-zero"),
+                        NonZeroU32::new(physical.1).expect("non-zero"),
+                    )
+                    .expect("cache texture");
+                self.actors[index] = Some((handle, physical));
+                self.built += 1;
+            }
+            let handle = self.actors[index]
+                .as_ref()
+                .expect("just allocated")
+                .0
+                .clone();
+            let mut commands = CommandList::new();
+            commands.render_bitmap(
+                bitmap.clone(),
+                Transform {
+                    matrix: Matrix::rotate(((index + frame) as f32) * 0.03),
+                    color_transform: Default::default(),
+                    perspective_projection: None,
+                },
+                false,
+                PixelSnapping::Never,
+                PixelRegion::for_whole_size(logical.0.min(OBJECT.0), logical.1.min(OBJECT.1)),
+            );
+            entries.push(BitmapCacheEntry {
+                handle,
+                commands,
+                clear: Color::from_rgba(0),
+                filters: vec![Filter::GlowFilter(GlowFilter {
+                    color: Color::WHITE,
+                    blur_x: Fixed16::from_f32(4.0),
+                    blur_y: Fixed16::from_f32(4.0),
+                    strength: Fixed8::ONE,
+                    flags: GlowFilterFlags::from_passes(1),
+                })],
+                logical_width: logical.0,
+                logical_height: logical.1,
+            });
+        }
+        entries
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct CycleCost {
     frames: u64,
@@ -235,6 +302,17 @@ struct CycleCost {
     tracked_textures: usize,
     tracked_bytes: usize,
     slowest_ms: f64,
+    /// Phase 2: what the cycle really allocated, and what the graphics
+    /// allocator is holding to serve it.
+    cache_textures_built: u64,
+    textures_created: u64,
+    texture_bytes_created: u64,
+    offscreen_misses: u64,
+    cache_pool_takes: u64,
+    cache_pool_hits: u64,
+    allocator_allocated: u64,
+    allocator_reserved: u64,
+    allocator_blocks: usize,
 }
 
 #[test]
@@ -262,19 +340,11 @@ fn a_long_session_settles() {
     let bitmap = backend
         .register_bitmap(Bitmap::new(OBJECT.0, OBJECT.1, BitmapFormat::Rgba, pixels))
         .expect("bitmap registration");
-    let caches: Vec<(BitmapHandle, u32, u32)> = (0..48u32)
-        .map(|i| {
-            let width = 40 + (i % 13) * 11;
-            let height = 36 + (i % 9) * 15;
-            let handle = backend
-                .create_empty_texture(
-                    NonZeroU32::new(width).expect("non-zero"),
-                    NonZeroU32::new(height).expect("non-zero"),
-                )
-                .expect("cache texture");
-            (handle, width, height)
-        })
-        .collect();
+    // Cached objects whose bounds breathe, the way an animating avatar's do.
+    // The soak used to allocate these once and keep them for the whole run,
+    // which is the one thing a real session never does: the churn phase 2 is
+    // chasing is a cache being rebuilt because its picture moved by a pixel.
+    let mut caches = BreathingCaches::new(48);
 
     let mut cycles: Vec<CycleCost> = Vec::new();
     let mut frame = 0usize;
@@ -292,6 +362,10 @@ fn a_long_session_settles() {
     );
     while Instant::now() < deadline {
         let before = render_stats();
+        let churn_before = texture_churn();
+        let offscreen_before = pool_telemetry(PoolKind::Offscreen).misses_total();
+        let cache_pool_before = cache_pool_counters();
+        let built_before = caches.built;
         let mut cost = CycleCost::default();
         for phase in CYCLE {
             let phase_start = render_stats();
@@ -301,7 +375,11 @@ fn a_long_session_settles() {
                     settled_start = render_stats().bind_groups_created;
                 }
                 let commands = scene(&bitmap, *phase, frame);
-                let entries = cache_entries(&bitmap, &caches, *phase, frame);
+                let entries = if *phase == Phase::Filtered {
+                    caches.entries(&mut backend, &bitmap, frame)
+                } else {
+                    vec![]
+                };
                 let start = Instant::now();
                 backend.submit_frame(Color::BLACK, commands, entries);
                 backend.capture_frame().expect("capture must succeed");
@@ -326,6 +404,19 @@ fn a_long_session_settles() {
             }
         }
         let after = render_stats();
+        let churn_after = texture_churn();
+        let cache_pool_after = cache_pool_counters();
+        let allocator = allocator_report(&backend);
+        cost.cache_textures_built = caches.built - built_before;
+        cost.textures_created = churn_after.0 - churn_before.0;
+        cost.texture_bytes_created = churn_after.2 - churn_before.2;
+        cost.offscreen_misses =
+            pool_telemetry(PoolKind::Offscreen).misses_total() - offscreen_before;
+        cost.cache_pool_takes = cache_pool_after.takes - cache_pool_before.takes;
+        cost.cache_pool_hits = cache_pool_after.hits - cache_pool_before.hits;
+        cost.allocator_allocated = allocator.0;
+        cost.allocator_reserved = allocator.1;
+        cost.allocator_blocks = allocator.2;
         let (textures, bytes) = tracked_texture_totals();
         cost.bind_groups_built = after.bind_groups_created - before.bind_groups_created;
         cost.blends = after.fastpath_eligible - before.fastpath_eligible;
@@ -345,6 +436,20 @@ fn a_long_session_settles() {
             cost.bind_groups_built,
             cost.tracked_textures,
             cost.slowest_ms,
+        );
+        println!(
+            "         allocated {} textures ({:.1} MB), {} of them cache rebuilds; \
+             cache pool {}/{} recycled; offscreen misses {}; \
+             allocator {:.1}/{:.1} MB in {} blocks",
+            cost.textures_created,
+            cost.texture_bytes_created as f64 / (1024.0 * 1024.0),
+            cost.cache_textures_built,
+            cost.cache_pool_hits,
+            cost.cache_pool_takes,
+            cost.offscreen_misses,
+            cost.allocator_allocated as f64 / (1024.0 * 1024.0),
+            cost.allocator_reserved as f64 / (1024.0 * 1024.0),
+            cost.allocator_blocks,
         );
         // Bind groups live on the pooled textures they name, so a cache that
         // was missing would build one per blend per frame. This scene drifts,
@@ -423,4 +528,54 @@ fn a_long_session_settles() {
         "{early} bind groups over the first half of the run and {late} over the second; \
          something is building more of them as it goes"
     );
+
+    // --- phase 2: allocation traffic, and what the allocator holds to serve it
+    let early_created: u64 = settled[..half].iter().map(|c| c.textures_created).sum();
+    let late_created: u64 = settled[half..].iter().map(|c| c.textures_created).sum();
+    let early_cache: u64 = settled[..half].iter().map(|c| c.cache_textures_built).sum();
+    let late_cache: u64 = settled[half..].iter().map(|c| c.cache_textures_built).sum();
+    println!(
+        "\ntextures allocated: {early_created} over the first {half} settled cycles, \
+         {late_created} over the last {}; cache rebuilds {early_cache} -> {late_cache}",
+        settled.len() - half
+    );
+    println!(
+        "allocator: {:.1}/{:.1} MB in {} blocks after the first settled cycle, \
+         {:.1}/{:.1} MB in {} blocks at the end",
+        first.allocator_allocated as f64 / (1024.0 * 1024.0),
+        first.allocator_reserved as f64 / (1024.0 * 1024.0),
+        first.allocator_blocks,
+        last.allocator_allocated as f64 / (1024.0 * 1024.0),
+        last.allocator_reserved as f64 / (1024.0 * 1024.0),
+        last.allocator_blocks,
+    );
+
+    // A room that keeps coming back to scenes it has already drawn should stop
+    // allocating. This is the phase 2 target: not zero - the pool gives sizes
+    // back and a drifting scene meets new ones - but bounded, and no worse in
+    // the second half of a long run than in the first.
+    assert!(
+        late_created * 4 <= early_created * 5,
+        "{early_created} textures allocated over the first half of the run and \
+         {late_created} over the second; the creation rate is not settling"
+    );
+    assert!(
+        late_cache * 4 <= early_cache * 5 + 4,
+        "{early_cache} cache rebuilds over the first half and {late_cache} over the \
+         second; the capacity is not holding"
+    );
+
+    // The reserve is what the driver's allocator keeps in order to serve the
+    // allocations, and it is the part that shows up in the process's private
+    // bytes without appearing in any count of live textures. It may grow to
+    // meet a scene; it may not keep growing once the scenes repeat.
+    if first.allocator_reserved > 0 {
+        assert!(
+            last.allocator_reserved <= first.allocator_reserved * 3 / 2,
+            "the allocator reserved {:.1} MB after the first settled cycle and {:.1} MB \
+             at the end; it is ratcheting",
+            first.allocator_reserved as f64 / (1024.0 * 1024.0),
+            last.allocator_reserved as f64 / (1024.0 * 1024.0),
+        );
+    }
 }

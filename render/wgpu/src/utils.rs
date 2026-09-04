@@ -202,6 +202,13 @@ pub fn supported_sample_count(
 }
 
 #[expect(clippy::too_many_arguments)]
+/// Copies `input` over `frame_view`.
+///
+/// `viewport` holds the copy to a rectangle at the destination's top-left
+/// corner, for when the destination texture is bigger than the picture being
+/// written into it - a `cacheAsBitmap` texture kept across a change of size.
+/// `None` covers the whole destination, which is what every other caller wants.
+#[expect(clippy::too_many_arguments)]
 pub fn run_copy_pipeline(
     descriptors: &Descriptors,
     format: wgpu::TextureFormat,
@@ -211,6 +218,7 @@ pub fn run_copy_pipeline(
     globals: &Globals,
     sample_count: u32,
     encoder: &mut CommandEncoder,
+    viewport: Option<(u32, u32)>,
 ) {
     let copy_bind_group = descriptors
         .device
@@ -252,6 +260,10 @@ pub fn run_copy_pipeline(
     });
 
     render_pass.set_pipeline(&pipeline);
+    if let Some((width, height)) = viewport {
+        render_pass.set_viewport(0.0, 0.0, width as f32, height as f32, 0.0, 1.0);
+        render_pass.set_scissor_rect(0, 0, width, height);
+    }
     render_pass.set_bind_group(0, globals.bind_group(), &[]);
 
     render_pass.set_bind_group(1, whole_frame_bind_group, &[0]);

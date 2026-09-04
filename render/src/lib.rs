@@ -4,6 +4,8 @@ pub mod atf;
 pub mod backend;
 pub mod bitmap;
 pub mod blend;
+pub mod cache_capacity;
+pub mod cache_stats;
 pub mod error;
 pub mod filters;
 pub mod lines;
