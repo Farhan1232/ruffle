@@ -81,7 +81,7 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     offscreen_texture_pool: TexturePool,
     /// Frames drawn since the surface pool was last given the chance to
     /// release targets it no longer needs.
-    frames_since_pool_trim: u32,
+    last_pool_trim: std::time::Instant,
     pub(crate) offscreen_buffer_pool: Arc<BufferPool<wgpu::Buffer, BufferDimensions>>,
     dynamic_transforms: DynamicTransforms,
     active_frame: ActiveFrame,
@@ -219,11 +219,16 @@ impl WgpuRenderBackend<crate::target::TextureTarget> {
     }
 }
 
-/// How often the surface pool is offered the chance to release idle targets.
-/// Roughly two seconds of play: long enough that a scene alternating between
-/// shapes never loses the targets it is cycling through, short enough that a
-/// crowd which has left gives its memory back during the same session.
-const FRAMES_BETWEEN_POOL_TRIMS: u32 = 60;
+/// How often the render-target pools are offered the chance to release idle
+/// targets. Long enough that a scene alternating between shapes never loses the
+/// targets it is cycling through, short enough that a crowd which has left
+/// gives its memory back during the same session.
+///
+/// Counted in time rather than in frames, because a pool most needs trimming
+/// when frames are slow, and that is exactly when a frame count comes round
+/// least often. A run of the filtered-avatar harness took over a minute per
+/// trim that way, and the offscreen pool reached 2.5 GiB between them.
+const POOL_TRIM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl<T: RenderTarget> WgpuRenderBackend<T> {
     pub fn new(descriptors: Arc<Descriptors>, target: T) -> Result<Self, Error> {
@@ -284,8 +289,8 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             shape_tessellator: ShapeTessellator::new(),
             viewport_scale_factor: 1.0,
             texture_pool: TexturePool::new(),
-            offscreen_texture_pool: TexturePool::new(),
-            frames_since_pool_trim: 0,
+            offscreen_texture_pool: TexturePool::new_offscreen(),
+            last_pool_trim: std::time::Instant::now(),
             offscreen_buffer_pool: Arc::new(offscreen_buffer_pool),
             dynamic_transforms: transforms,
             active_frame,
@@ -712,9 +717,8 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         // more than a few megabytes at a time. Trimming bounds it just as well
         // and lets a cached object's filter targets survive to the next frame,
         // which is where they are wanted again a sixtieth of a second later.
-        self.frames_since_pool_trim += 1;
-        if self.frames_since_pool_trim >= FRAMES_BETWEEN_POOL_TRIMS {
-            self.frames_since_pool_trim = 0;
+        if self.last_pool_trim.elapsed() >= POOL_TRIM_INTERVAL {
+            self.last_pool_trim = std::time::Instant::now();
             self.offscreen_texture_pool.trim_idle();
             self.texture_pool.trim_idle();
         }
