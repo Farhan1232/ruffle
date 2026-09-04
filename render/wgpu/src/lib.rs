@@ -30,7 +30,7 @@ type Error = Box<dyn std::error::Error>;
 pub mod utils;
 
 mod bitmaps;
-pub mod bounds;
+mod bounds;
 mod context3d;
 mod globals;
 mod pipelines;
