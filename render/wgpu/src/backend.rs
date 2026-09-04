@@ -18,7 +18,9 @@ use image::imageops::FilterType;
 use ruffle_render::backend::{
     BitmapCacheEntry, Context3D, Context3DProfile, PixelBenderOutput, PixelBenderTarget,
 };
-use ruffle_render::backend::{RenderBackend, RenderMemoryUsage, ShapeHandle, ViewportDimensions};
+use ruffle_render::backend::{
+    PoolKeyReport, RenderBackend, RenderMemoryUsage, ShapeHandle, ViewportDimensions,
+};
 use ruffle_render::bitmap::{
     Bitmap, BitmapFormat, BitmapHandle, BitmapSource, PixelRegion, RgbaBufRead, SyncHandle,
 };
@@ -220,9 +222,10 @@ impl WgpuRenderBackend<crate::target::TextureTarget> {
 }
 
 /// How often the surface pool is offered the chance to release idle targets.
-/// Roughly two seconds of play: long enough that a scene alternating between
-/// shapes never loses the targets it is cycling through, short enough that a
-/// crowd which has left gives its memory back during the same session.
+/// Roughly every two seconds of play, which is long enough that a scene
+/// alternating between two shapes never loses the targets it is cycling
+/// through, and short enough that a crowd which has left gives its memory back
+/// while the player is still in the session.
 const FRAMES_BETWEEN_POOL_TRIMS: u32 = 60;
 
 impl<T: RenderTarget> WgpuRenderBackend<T> {
@@ -283,8 +286,8 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             meshes: Vec::new(),
             shape_tessellator: ShapeTessellator::new(),
             viewport_scale_factor: 1.0,
-            texture_pool: TexturePool::new(),
-            offscreen_texture_pool: TexturePool::new(),
+            texture_pool: TexturePool::new(crate::TextureKind::PoolMain),
+            offscreen_texture_pool: TexturePool::new(crate::TextureKind::PoolOffscreen),
             frames_since_pool_trim: 0,
             offscreen_buffer_pool: Arc::new(offscreen_buffer_pool),
             dynamic_transforms: transforms,
@@ -467,7 +470,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         );
 
         self.viewport_scale_factor = dimensions.scale_factor;
-        self.texture_pool = TexturePool::new();
+        self.texture_pool = TexturePool::new(crate::TextureKind::PoolMain);
     }
 
     fn create_context3d(
@@ -480,11 +483,52 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         )))
     }
 
-    fn memory_usage(&self) -> Option<RenderMemoryUsage> {
+    fn memory_usage(&mut self) -> Option<RenderMemoryUsage> {
         let counters = self.descriptors.device.get_internal_counters().hal;
         let read = |value: isize| value.max(0) as usize;
         let (meshes, mesh_bytes) = Mesh::live_totals();
-        let (tracked_textures, tracked_texture_bytes) = crate::tracked_texture_totals();
+        let stats = crate::texture_stats();
+        let (main_classes, main_idle, main_idle_bytes) = self.texture_pool.idle_totals();
+        let (off_classes, off_idle, off_idle_bytes) = self.offscreen_texture_pool.idle_totals();
+        let (buffer_idle, buffer_idle_bytes) = self
+            .offscreen_buffer_pool
+            .idle_totals(|dimensions| dimensions.padded_bytes_per_row as usize * dimensions.height);
+
+        // The heaviest retained size classes across both pools, so the log can
+        // name what is holding memory instead of only totalling it.
+        let mut classes: Vec<_> = self
+            .texture_pool
+            .size_classes()
+            .into_iter()
+            .map(|c| ("main", c))
+            .chain(
+                self.offscreen_texture_pool
+                    .size_classes()
+                    .into_iter()
+                    .map(|c| ("offscreen", c)),
+            )
+            .filter(|(_, class)| class.idle_entries > 0 || class.borrowed > 0)
+            .map(|(pool, c)| PoolKeyReport {
+                pool,
+                width: c.width,
+                height: c.height,
+                sample_count: c.sample_count,
+                format: format!("{:?}", c.format),
+                usage: format!("{:?}", c.usage),
+                idle_entries: c.idle_entries,
+                idle_bytes: c.idle_bytes,
+                borrowed: c.borrowed,
+                peak_borrowed: c.peak_borrowed,
+                recent_peak_borrowed: c.recent_peak_borrowed,
+                reuses: c.reuses,
+                misses_pool_empty: c.misses_pool_empty,
+                misses_new_key: c.misses_new_key,
+                retained_target: c.retained_target,
+            })
+            .collect();
+        classes.sort_by(|a, b| b.idle_bytes.cmp(&a.idle_bytes));
+        classes.truncate(8);
+
         Some(RenderMemoryUsage {
             textures: read(counters.textures.read()),
             texture_bytes: read(counters.texture_memory.read()),
@@ -492,8 +536,31 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             buffer_bytes: read(counters.buffer_memory.read()),
             meshes,
             mesh_bytes,
-            tracked_textures,
-            tracked_texture_bytes,
+            tracked_textures: stats.total_live_count(),
+            tracked_texture_bytes: stats.total_live_bytes(),
+            texture_kind_names: &crate::KIND_NAMES,
+            texture_kind_live_counts: stats.live_count.to_vec(),
+            texture_kind_live_bytes: stats.live_bytes.to_vec(),
+            texture_kind_created: stats.created_count.to_vec(),
+            texture_kind_created_bytes: stats.created_bytes.to_vec(),
+            texture_kind_dropped: stats.dropped_count.to_vec(),
+            texture_kind_dropped_bytes: stats.dropped_bytes.to_vec(),
+            peak_texture_bytes: stats.peak_live_bytes,
+            pool_reuses: stats.pool_reuses,
+            pool_misses: stats.pool_misses,
+            main_pool_idle_textures: main_idle,
+            main_pool_idle_bytes: main_idle_bytes,
+            main_pool_size_classes: main_classes,
+            offscreen_pool_idle_textures: off_idle,
+            offscreen_pool_idle_bytes: off_idle_bytes,
+            offscreen_pool_size_classes: off_classes,
+            buffer_pool_idle_entries: buffer_idle,
+            buffer_pool_idle_bytes: buffer_idle_bytes,
+            pool_keys: classes,
+            textures_created: stats.created_count.iter().sum(),
+            texture_bytes_created: stats.created_bytes.iter().sum(),
+            textures_dropped: stats.dropped_count.iter().sum(),
+            texture_bytes_dropped: stats.dropped_bytes.iter().sum(),
         })
     }
 
@@ -766,7 +833,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             extent,
         );
 
-        let handle = BitmapHandle(Arc::new(Texture::new(texture)));
+        let handle = BitmapHandle(Arc::new(Texture::new(texture, crate::TextureKind::Bitmap)));
 
         Ok(handle)
     }
@@ -1037,7 +1104,10 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                             | wgpu::TextureUsages::RENDER_ATTACHMENT
                             | wgpu::TextureUsages::COPY_SRC,
                     });
-                BitmapHandle(Arc::new(Texture::new(texture)))
+                BitmapHandle(Arc::new(Texture::new(
+                    texture,
+                    crate::TextureKind::Temporary,
+                )))
             }
         };
 
@@ -1190,7 +1260,10 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     | wgpu::TextureUsages::RENDER_ATTACHMENT
                     | wgpu::TextureUsages::COPY_SRC,
             });
-        Ok(BitmapHandle(Arc::new(Texture::new(texture))))
+        Ok(BitmapHandle(Arc::new(Texture::new(
+            texture,
+            crate::TextureKind::CacheAsBitmap,
+        ))))
     }
 
     fn resolve_sync_handle(
