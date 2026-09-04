@@ -297,7 +297,20 @@ impl TexturePool {
             }
             !dormant
         });
+        released += self.enforce_idle_budget();
+        self.trim_globals();
+        released
+    }
 
+    /// Gives up the sizes least recently asked for until what is held idle fits
+    /// the budget, returning the bytes released.
+    ///
+    /// Called whenever a size is met for the first time, not only when the pool
+    /// is trimmed: a scene of animating filtered objects can meet two thousand
+    /// sizes between one trim and the next, and a bound that applies only every
+    /// couple of seconds is not a bound on the peak. Only idle targets are
+    /// counted and released - what a frame is using is untouchable.
+    fn enforce_idle_budget(&mut self) -> usize {
         let idle: Vec<(u64, TextureKey, usize)> = self
             .pools
             .iter()
@@ -310,6 +323,7 @@ impl TexturePool {
                 )
             })
             .collect();
+        let mut released = 0;
         for key in sizes_over_budget(idle, self.idle_budget) {
             if let Some(size_pool) = self.pools.get_mut(&key) {
                 released += size_pool.pool.idle_len() * key.bytes();
@@ -319,8 +333,6 @@ impl TexturePool {
                 }
             }
         }
-
-        self.trim_globals();
         released
     }
 
@@ -409,12 +421,16 @@ impl TexturePool {
         if fresh_key {
             size_pool.pool.note_new_key();
         }
+        let entry = size_pool.pool.take(descriptors, AlwaysCompatible);
+        if fresh_key {
+            self.enforce_idle_budget();
+        }
         POOL_TAKES.fetch_add(1, Ordering::Relaxed);
         POOL_PIXELS.fetch_add(
             u64::from(size.width) * u64::from(size.height),
             Ordering::Relaxed,
         );
-        size_pool.pool.take(descriptors, AlwaysCompatible)
+        entry
     }
 
     /// `(distinct sizes pooled, textures idle in free lists, their bytes)`.
