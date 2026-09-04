@@ -802,14 +802,34 @@ fn trivial_fast_path(
 ) -> Result<(), crate::FallbackReason> {
     use crate::FallbackReason;
 
-    // Only the modes that are a blend state and nothing more. A complex blend
-    // reads the destination in a shader and genuinely needs the group rendered
-    // out first; a PixelBender blend is arbitrary code.
-    match blend_type {
-        BlendType::Trivial(_) => {}
+    // A complex blend reads the destination in a shader and genuinely needs the
+    // group rendered out first; a PixelBender blend is arbitrary code.
+    let trivial = match blend_type {
+        BlendType::Trivial(trivial) => trivial,
         BlendType::Complex(_) | BlendType::Shader(_) => {
             return Err(FallbackReason::ComplexBlend);
         }
+    };
+
+    // Of the blend states, only `Normal` gives the same answer applied per
+    // multisample as applied to the resolved group.
+    //
+    // Take `Add` on a rotated bitmap. Through a target, the group is resolved
+    // first, so an edge covering half the samples contributes half its colour
+    // and the sum is clamped once: `min(1, dst + c*src)`. Drawn directly, the
+    // sum is clamped at each covered sample and the resolve averages the
+    // clamped values: `c*min(1, dst + src) + (1-c)*dst`. Those differ wherever
+    // the sum saturates, which on a light background is most of the edge - it
+    // showed as a 43-level difference along the edges of a rotated bitmap.
+    // `Normal` cannot saturate: a premultiplied source is at most its own
+    // alpha, so `src + dst*(1-a)` is at most 1, and the two orders agree
+    // exactly.
+    //
+    // This still covers `BlendMode::LAYER`, which is the mode that wraps a
+    // group so it composites as a unit, and so the one a cached or filtered
+    // display object arrives under.
+    if !matches!(trivial, TrivialBlend::Normal) {
+        return Err(FallbackReason::UnsupportedBlendMode);
     }
 
     let [command] = commands.commands.as_slice() else {

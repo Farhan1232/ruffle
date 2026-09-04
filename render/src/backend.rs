@@ -167,6 +167,7 @@ pub const FALLBACK_COLUMN_NAMES: &[&str] = &[
     "masked",
     "nested_blend",
     "complex_blend",
+    "unsupported_blend_mode",
     "unsupported_command",
     "requires_intermediate",
     "other",
@@ -195,6 +196,21 @@ pub struct RenderWorkUsage {
     /// Why the rest did not, in the order of `fallback_names`.
     pub fallback_names: &'static [&'static str],
     pub fallbacks: Vec<u64>,
+    /// Where the renderer's share of the frames went, in nanoseconds. The rest
+    /// of a frame is ActionScript, collection and the display list, which the
+    /// renderer cannot see; the frontend's frame time minus `render_ns_total`
+    /// is that share.
+    pub render_ns_total: u64,
+    pub render_ns_cache_entries: u64,
+    pub render_ns_frame_commands: u64,
+    pub render_ns_queue_submit: u64,
+    /// Frames whose *rendering* alone missed the 41.67 ms budget, and those
+    /// that took over 100 ms, with where their time went.
+    pub slow_frames: u64,
+    pub very_slow_frames: u64,
+    pub slow_ns_cache_entries: u64,
+    pub slow_ns_frame_commands: u64,
+    pub slow_ns_queue_submit: u64,
 }
 
 pub trait RenderBackend: Any {

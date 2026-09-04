@@ -17,7 +17,7 @@ use crate::context::UpdateContext;
 
 /// Identifies this instrumentation, so a log can be tied to the build that
 /// produced it. Bump it whenever the columns change.
-pub const INSTRUMENTATION_VERSION: &str = "aqw-blend-bounds-1";
+pub const INSTRUMENTATION_VERSION: &str = "aqw-blend-overhead-diag-3";
 
 /// What a single still-resident movie is keeping alive.
 #[derive(Debug, Clone)]
@@ -249,7 +249,11 @@ impl MemoryReport {
              render_passes,blend_targets_live,blend_target_bytes,\
              peak_blend_targets,peak_blend_target_bytes,\
              bind_groups_created,bind_group_cache_hits,bind_group_cache_misses,\
-             trivial_blend_fastpath_eligible,trivial_blend_fastpath_used",
+             trivial_blend_fastpath_eligible,trivial_blend_fastpath_used,\
+             render_ns_total,render_ns_cache_entries,render_ns_frame_commands,\
+             render_ns_queue_submit,render_slow_frames,render_very_slow_frames,\
+             render_slow_ns_cache_entries,render_slow_ns_frame_commands,\
+             render_slow_ns_queue_submit",
         );
         for name in ruffle_render::backend::FALLBACK_COLUMN_NAMES {
             let _ = write!(header, ",fastpath_fallback_{name}");
@@ -345,6 +349,19 @@ impl MemoryReport {
             self.work.bind_group_cache_misses,
             self.work.fastpath_eligible,
             self.work.fastpath_used,
+        );
+        let _ = write!(
+            row,
+            ",{},{},{},{},{},{},{},{},{}",
+            self.work.render_ns_total,
+            self.work.render_ns_cache_entries,
+            self.work.render_ns_frame_commands,
+            self.work.render_ns_queue_submit,
+            self.work.slow_frames,
+            self.work.very_slow_frames,
+            self.work.slow_ns_cache_entries,
+            self.work.slow_ns_frame_commands,
+            self.work.slow_ns_queue_submit,
         );
         for i in 0..ruffle_render::backend::FALLBACK_COLUMN_NAMES.len() {
             let _ = write!(row, ",{}", self.work.fallbacks.get(i).copied().unwrap_or(0));

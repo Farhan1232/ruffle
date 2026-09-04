@@ -240,6 +240,9 @@ impl MemoryReporter {
              (+{} MiB since first sample), {} pending loaders, {} class aliases, \
              gc {} MiB / {} objects (+{} MiB external), gpu {} textures {} MiB + buffers {} MiB, \
              {} meshes {} MiB, textures live {} MiB (peak {} MiB){}, \
+             work: {} passes, {} blend targets, {} bind groups built ({:.0}% cached), \
+             {:.0}% of blends drawn without a target, \
+             driver {} allocations {} MiB live of {} MiB reserved, \
              pools idle: main {} MiB / {} sizes, offscreen {} MiB / {} sizes, buffers {} MiB, \
              pool reuse {}/{}, churn {} MiB/s, \
              frame ms mean {:.1} p95 {:.1} p99 {:.1} max {:.1} ({} over 33 ms){}{}",
@@ -263,6 +266,25 @@ impl MemoryReporter {
             report.tracked_texture_bytes / (1024 * 1024),
             report.peak_texture_bytes / (1024 * 1024),
             kind_breakdown,
+            report.work.render_passes,
+            report.work.blend_targets,
+            report.work.bind_groups_created,
+            {
+                let total = report.work.bind_group_cache_hits + report.work.bind_group_cache_misses;
+                if total > 0 {
+                    100.0 * report.work.bind_group_cache_hits as f64 / total as f64
+                } else {
+                    0.0
+                }
+            },
+            if report.work.fastpath_eligible > 0 {
+                100.0 * report.work.fastpath_used as f64 / report.work.fastpath_eligible as f64
+            } else {
+                0.0
+            },
+            report.hal.memory_allocations,
+            report.allocator.map(|a| a.allocated_bytes).unwrap_or(0) / (1024 * 1024),
+            report.allocator.map(|a| a.reserved_bytes).unwrap_or(0) / (1024 * 1024),
             report.main_pool_idle_bytes / (1024 * 1024),
             report.main_pool_size_classes,
             report.offscreen_pool_idle_bytes / (1024 * 1024),

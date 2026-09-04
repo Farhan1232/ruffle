@@ -17,6 +17,12 @@ $sha     = (Get-FileHash $Exe -Algorithm SHA256).Hash
 # rather than repeating it here where it can go stale.
 $instr   = (Select-String -Path .\core\src\memory_report.rs `
               -Pattern 'INSTRUMENTATION_VERSION: &str = "([^"]+)"').Matches[0].Groups[1].Value
+# The production commit this diagnostic build carries, found rather than
+# remembered: the newest commit that is also on the production branch.
+$prod    = (git merge-base HEAD origin/fix/aqw-blend-render-performance 2>$null)
+if (-not $prod) { $prod = (git merge-base HEAD fix/aqw-blend-render-performance 2>$null) }
+if (-not $prod) { $prod = "unknown - production branch not fetched" }
+$prodSubject = if ($prod -match '^[0-9a-f]{40}$') { git log -1 --pretty=%s $prod } else { "" }
 
 @"
 === AQW GPU MEMORY DIAGNOSTIC BUILD ===
@@ -27,6 +33,8 @@ commit       : $commit
 worktree     : $dirty
 instrument   : $instr
 head subject : $subject
+production   : $prod
+production subject : $prodSubject
 exe path     : $($item.FullName)
 exe modified : $($item.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'))
 exe size     : $($item.Length) bytes

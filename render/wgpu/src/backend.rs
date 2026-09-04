@@ -607,6 +607,15 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     fastpath_used: work.fastpath_used,
                     fallback_names: crate::render_stats::FALLBACK_NAMES,
                     fallbacks: work.fallbacks,
+                    render_ns_total: work.timing.total_ns,
+                    render_ns_cache_entries: work.timing.cache_entries_ns,
+                    render_ns_frame_commands: work.timing.frame_commands_ns,
+                    render_ns_queue_submit: work.timing.queue_submit_ns,
+                    slow_frames: work.timing.slow_frames,
+                    very_slow_frames: work.timing.very_slow_frames,
+                    slow_ns_cache_entries: work.timing.slow_cache_entries_ns,
+                    slow_ns_frame_commands: work.timing.slow_frame_commands_ns,
+                    slow_ns_queue_submit: work.timing.slow_queue_submit_ns,
                 }
             },
         })
@@ -706,6 +715,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             return;
         };
 
+        let phase_start = std::time::Instant::now();
         for entry in cache_entries {
             let texture = as_texture(&entry.handle);
             let surface = Surface::new(
@@ -791,6 +801,9 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             self.active_frame.maybe_flush(&self.descriptors);
         }
 
+        let cache_entries_ns = phase_start.elapsed().as_nanos() as u64;
+        let phase_start = std::time::Instant::now();
+
         self.surface.draw_commands_and_copy_to(
             frame_output.view(),
             RenderTargetMode::FreshWithColor(wgpu::Color {
@@ -810,10 +823,17 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             LayerRef::None,
             &mut self.texture_pool,
         );
+        let frame_commands_ns = phase_start.elapsed().as_nanos() as u64;
+        let phase_start = std::time::Instant::now();
         self.active_frame.staging_belt.finish();
 
         self.active_frame
             .submit_for_target(&self.descriptors, &self.target, frame_output);
+        crate::render_stats::record_frame_timing(
+            cache_entries_ns,
+            frame_commands_ns,
+            phase_start.elapsed().as_nanos() as u64,
+        );
         crate::render_stats::end_frame();
 
         // Both pools live for the whole session, so they grow to the busiest

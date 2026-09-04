@@ -444,6 +444,9 @@ pub mod render_stats {
         Masked,
         NestedBlend,
         ComplexBlend,
+        /// A trivial blend whose state does not survive being applied per
+        /// multisample rather than to the resolved group.
+        UnsupportedBlendMode,
         UnsupportedCommand,
         RequiresIntermediate,
         Other,
@@ -455,12 +458,14 @@ pub mod render_stats {
         "masked",
         "nested_blend",
         "complex_blend",
+        "unsupported_blend_mode",
         "unsupported_command",
         "requires_intermediate",
         "other",
     ];
 
-    static FALLBACKS: [AtomicU64; 8] = [
+    static FALLBACKS: [AtomicU64; 9] = [
+        AtomicU64::new(0),
         AtomicU64::new(0),
         AtomicU64::new(0),
         AtomicU64::new(0),
@@ -485,6 +490,60 @@ pub mod render_stats {
             BIND_GROUP_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
         } else {
             BIND_GROUP_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    static SUBMIT_NS: AtomicU64 = AtomicU64::new(0);
+    static CACHE_ENTRIES_NS: AtomicU64 = AtomicU64::new(0);
+    static FRAME_COMMANDS_NS: AtomicU64 = AtomicU64::new(0);
+    static QUEUE_SUBMIT_NS: AtomicU64 = AtomicU64::new(0);
+    static SLOW_FRAMES: AtomicU64 = AtomicU64::new(0);
+    static VERY_SLOW_FRAMES: AtomicU64 = AtomicU64::new(0);
+    static SLOW_CACHE_ENTRIES_NS: AtomicU64 = AtomicU64::new(0);
+    static SLOW_FRAME_COMMANDS_NS: AtomicU64 = AtomicU64::new(0);
+    static SLOW_QUEUE_SUBMIT_NS: AtomicU64 = AtomicU64::new(0);
+
+    /// One frame at AdventureQuest Worlds' 24 frames a second.
+    const FRAME_BUDGET_NS: u64 = 41_670_000;
+    const VERY_SLOW_NS: u64 = 100_000_000;
+
+    /// Where the renderer's share of a frame went.
+    ///
+    /// The renderer can only account for its own half; the rest of a frame is
+    /// ActionScript, garbage collection and walking the display list. Reading
+    /// `render_ns_total` against the frame time the frontend measures is what
+    /// splits the two, and the `slow_` totals say where the renderer's time
+    /// went in the frames that missed the budget - which are the only ones
+    /// worth optimising.
+    #[derive(Copy, Clone, Debug, Default)]
+    pub struct FrameTiming {
+        pub total_ns: u64,
+        pub cache_entries_ns: u64,
+        pub frame_commands_ns: u64,
+        pub queue_submit_ns: u64,
+        pub slow_frames: u64,
+        pub very_slow_frames: u64,
+        pub slow_cache_entries_ns: u64,
+        pub slow_frame_commands_ns: u64,
+        pub slow_queue_submit_ns: u64,
+    }
+
+    /// Records what one frame's phases cost. Called once per frame from the
+    /// backend, so four clock reads a frame.
+    pub(crate) fn record_frame_timing(cache_entries: u64, frame_commands: u64, queue_submit: u64) {
+        let total = cache_entries + frame_commands + queue_submit;
+        SUBMIT_NS.fetch_add(total, Ordering::Relaxed);
+        CACHE_ENTRIES_NS.fetch_add(cache_entries, Ordering::Relaxed);
+        FRAME_COMMANDS_NS.fetch_add(frame_commands, Ordering::Relaxed);
+        QUEUE_SUBMIT_NS.fetch_add(queue_submit, Ordering::Relaxed);
+        if total > FRAME_BUDGET_NS {
+            SLOW_FRAMES.fetch_add(1, Ordering::Relaxed);
+            SLOW_CACHE_ENTRIES_NS.fetch_add(cache_entries, Ordering::Relaxed);
+            SLOW_FRAME_COMMANDS_NS.fetch_add(frame_commands, Ordering::Relaxed);
+            SLOW_QUEUE_SUBMIT_NS.fetch_add(queue_submit, Ordering::Relaxed);
+        }
+        if total > VERY_SLOW_NS {
+            VERY_SLOW_FRAMES.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -541,6 +600,8 @@ pub mod render_stats {
         pub fallbacks: Vec<u64>,
         /// Render passes encoded for the most recent frame.
         pub render_passes_last_frame: u64,
+        /// Where the renderer's share of the frames went.
+        pub timing: FrameTiming,
     }
 
     pub fn render_stats() -> RenderStats {
@@ -560,11 +621,22 @@ pub mod render_stats {
                 .map(|c| c.load(Ordering::Relaxed))
                 .collect(),
             render_passes_last_frame: LAST_FRAME_RENDER_PASSES.load(Ordering::Relaxed),
+            timing: FrameTiming {
+                total_ns: SUBMIT_NS.load(Ordering::Relaxed),
+                cache_entries_ns: CACHE_ENTRIES_NS.load(Ordering::Relaxed),
+                frame_commands_ns: FRAME_COMMANDS_NS.load(Ordering::Relaxed),
+                queue_submit_ns: QUEUE_SUBMIT_NS.load(Ordering::Relaxed),
+                slow_frames: SLOW_FRAMES.load(Ordering::Relaxed),
+                very_slow_frames: VERY_SLOW_FRAMES.load(Ordering::Relaxed),
+                slow_cache_entries_ns: SLOW_CACHE_ENTRIES_NS.load(Ordering::Relaxed),
+                slow_frame_commands_ns: SLOW_FRAME_COMMANDS_NS.load(Ordering::Relaxed),
+                slow_queue_submit_ns: SLOW_QUEUE_SUBMIT_NS.load(Ordering::Relaxed),
+            },
         }
     }
 }
 
-pub use render_stats::{FallbackReason, RenderStats, render_stats};
+pub use render_stats::{FallbackReason, FrameTiming, RenderStats, render_stats};
 
 pub(crate) fn texture_stats_record_pool_reuse() {
     texture_stats::record_pool_reuse();
