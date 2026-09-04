@@ -28,7 +28,7 @@ use ruffle_render_wgpu::target::TextureTarget;
 use ruffle_render_wgpu::wgpu;
 use ruffle_render_wgpu::{RenderStats, render_stats};
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use swf::{BlendMode, Color, Fixed8, Fixed16, GlowFilter, GlowFilterFlags, Twips};
 
@@ -57,6 +57,16 @@ fn crowds() -> Vec<usize> {
 
 const WARMUP_FRAMES: usize = 3;
 const MEASURED_FRAMES: usize = 10;
+
+/// The counters these tests read are process-wide, and so is the GPU they
+/// share, so they have to run one at a time whatever `--test-threads` says.
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+fn exclusive() -> MutexGuard<'static, ()> {
+    ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn descriptors() -> Option<Arc<Descriptors>> {
     let instance =
@@ -211,6 +221,7 @@ fn test_bitmap(backend: &mut WgpuRenderBackend<TextureTarget>) -> BitmapHandle {
 
 #[test]
 fn a_crowded_room_does_not_ask_for_screen_sized_targets() {
+    let _exclusive = exclusive();
     let Some(descriptors) = descriptors() else {
         eprintln!("no GPU adapter available; skipping");
         return;
@@ -266,6 +277,17 @@ fn a_crowded_room_does_not_ask_for_screen_sized_targets() {
                 Measurement::percentile_ms(&m.frame_times, 0.99),
             );
 
+            // Bind groups are kept with the pooled texture they name, so a
+            // steady scene must stop building them. If this creeps up, the
+            // cache is missing - or worse, growing.
+            assert!(
+                m.work.bind_groups_created <= 2,
+                "{count} {blend_mode:?} blends built {} bind groups over {} frames; \
+                 the cache kept with the pooled targets is not holding",
+                m.work.bind_groups_created,
+                m.frames
+            );
+
             // The point of the exercise: an object a fraction of the screen's
             // size must not be given the screen. Allow generous slack for the
             // frame's own target and the size classes' rounding, and still
@@ -286,6 +308,7 @@ fn a_crowded_room_does_not_ask_for_screen_sized_targets() {
 /// key.
 #[test]
 fn a_steady_scene_stops_building_targets() {
+    let _exclusive = exclusive();
     let Some(descriptors) = descriptors() else {
         eprintln!("no GPU adapter available; skipping");
         return;
@@ -343,6 +366,7 @@ fn cache_entries(
 /// few megabytes.
 #[test]
 fn filtered_cached_objects_re_use_their_filter_targets() {
+    let _exclusive = exclusive();
     let Some(descriptors) = descriptors() else {
         eprintln!("no GPU adapter available; skipping");
         return;
@@ -462,6 +486,7 @@ fn mixed_room(
 
 #[test]
 fn how_much_of_an_aqw_shaped_room_takes_the_direct_path() {
+    let _exclusive = exclusive();
     let Some(descriptors) = descriptors() else {
         eprintln!("no GPU adapter available; skipping");
         return;

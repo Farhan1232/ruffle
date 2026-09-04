@@ -229,7 +229,8 @@ impl WgpuRenderBackend<crate::target::TextureTarget> {
 ///
 /// Counted in time rather than in frames, because a pool most needs trimming
 /// when frames are slow, and that is exactly when a frame count comes round
-/// least often.
+/// least often. A run of the filtered-avatar harness took over a minute per
+/// trim that way, and the offscreen pool reached 2.5 GiB between them.
 const POOL_TRIM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl<T: RenderTarget> WgpuRenderBackend<T> {
