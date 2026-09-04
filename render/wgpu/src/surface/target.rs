@@ -494,6 +494,7 @@ impl CommandTarget {
         if width == 0 || height == 0 {
             return blend_buffer;
         }
+        crate::render_stats::record_destination_copy(u64::from(width) * u64::from(height));
 
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
@@ -519,6 +520,17 @@ impl CommandTarget {
             },
         );
         blend_buffer
+    }
+
+    /// The snapshot of this target's pixels, if a blend has already asked for
+    /// one.
+    ///
+    /// [`update_blend_buffer`](Self::update_blend_buffer) both refreshes the
+    /// snapshot and hands it back; a batch of blends refreshes each of their
+    /// regions first and then reads the one buffer they all share, which is
+    /// what this is for.
+    pub fn blend_buffer(&self) -> Option<&BlendBuffer> {
+        self.blend_buffer.get()
     }
 
     pub fn color_view(&self) -> &wgpu::TextureView {

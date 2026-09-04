@@ -1,4 +1,5 @@
 mod commands;
+mod page;
 pub mod target;
 
 use crate::backend::RenderTargetMode;
@@ -10,7 +11,8 @@ use crate::dynamic_transforms::DynamicTransforms;
 use crate::filters::FilterSource;
 use crate::mesh::Mesh;
 use crate::pixel_bender::{ShaderMode, run_pixelbender_shader_impl};
-use crate::surface::commands::{Chunk, CommandRenderer, chunk_blends};
+use crate::surface::commands::{Chunk, ChunkedCommands, CommandRenderer, chunk_blends};
+use crate::surface::target::PoolOrArcTexture;
 use crate::utils::run_copy_pipeline;
 use crate::utils::supported_sample_count;
 use crate::{Descriptors, MaskState, Pipelines};
@@ -146,7 +148,14 @@ impl Surface {
 
         let mut num_masks = 0;
         let mut mask_state = MaskState::NoMask;
-        let chunks = chunk_blends(
+        // `pages` holds the shared targets the chunks composite from. Their
+        // passes are already encoded; keeping them here stops the pool handing
+        // one of them out again - and clearing it - before the chunk that reads
+        // it has been encoded.
+        let ChunkedCommands {
+            chunks,
+            pages: _pages,
+        } = chunk_blends(
             commands,
             descriptors,
             staging_belt,
@@ -162,9 +171,15 @@ impl Surface {
             texture_pool,
         );
 
-        for chunk in chunks {
-            match chunk {
-                Chunk::Draw {
+        // Consecutive complex blends that cannot see each other's work are
+        // composited together, in one pass off one snapshot of the destination.
+        for pass in batch_passes(
+            chunks,
+            max_batch(descriptors, dynamic_transforms),
+            nearest_layer,
+        ) {
+            match pass {
+                Pass::Draw {
                     chunk,
                     needs_stencil,
                     transforms,
@@ -213,9 +228,9 @@ impl Surface {
                     num_masks = renderer.num_masks();
                     mask_state = renderer.mask_state();
                 }
-                Chunk::Blend {
+                Pass::Shader {
                     texture,
-                    blend_mode: ChunkBlendMode::Shader(shader),
+                    shader,
                     needs_stencil,
                     rect,
                 } => {
@@ -254,65 +269,85 @@ impl Surface {
                     )
                     .expect("Failed to run PixelBender blend mode");
                 }
-                Chunk::Blend {
-                    texture,
-                    blend_mode: ChunkBlendMode::Complex(blend_mode),
+                Pass::Blends {
+                    blends,
                     needs_stencil,
-                    rect,
+                    reads_layer,
                 } => {
-                    let parent = match blend_mode {
-                        ComplexBlend::Alpha | ComplexBlend::Erase => {
-                            match nearest_layer {
-                                LayerRef::None => {
-                                    // An Alpha or Erase with no Layer above it should be ignored
-                                    continue;
-                                }
-                                LayerRef::Current => &target,
-                                LayerRef::Parent(layer) => layer,
-                            }
+                    let parent = if reads_layer {
+                        match nearest_layer {
+                            // An Alpha or Erase with no Layer above it is
+                            // dropped when the batches are built.
+                            LayerRef::None => continue,
+                            LayerRef::Current => &target,
+                            LayerRef::Parent(layer) => layer,
                         }
-                        _ => &target,
+                    } else {
+                        &target
                     };
 
-                    let parent_blend_buffer = parent.update_blend_buffer(
-                        descriptors,
-                        texture_pool,
-                        draw_encoder,
-                        sample_region(rect, parent.rect()),
-                    );
+                    // Every blend in the batch reads a part of the destination
+                    // that no other one in it writes, so one snapshot serves
+                    // them all; each of them still only refreshes its own
+                    // rectangle of it.
+                    for blend in &blends {
+                        parent.update_blend_buffer(
+                            descriptors,
+                            texture_pool,
+                            draw_encoder,
+                            sample_region(blend.rect, parent.rect()),
+                        );
+                    }
+                    let parent_blend_buffer = parent
+                        .blend_buffer()
+                        .expect("the snapshots above created the buffer");
 
                     // The blend covers only the rectangle its group drew into.
                     // The quad's own coordinates are the blended texture's, and
                     // its `uv` attribute is where each corner lands in the
                     // destination it reads - which is `parent`, not necessarily
                     // the target being drawn into.
-                    let (transform_offset, vertex_offset) = {
+                    let mut offsets = Vec::with_capacity(blends.len());
+                    {
                         let mut transforms = BufferBuilder::new_for_uniform(&descriptors.limits);
                         transforms.set_buffer_limit(dynamic_transforms.buffer.size());
                         let mut vertices = BufferBuilder::new_for_vertices(&descriptors.limits);
                         vertices.set_buffer_limit(dynamic_transforms.vertex_buffer.size());
 
                         let target_rect = target.rect();
-                        let transform_range = transforms
-                            .add(&[Transforms {
-                                world_matrix: [
-                                    [rect.width as f32, 0.0, 0.0, 0.0],
-                                    [0.0, rect.height as f32, 0.0, 0.0],
-                                    [0.0, 0.0, 1.0, 0.0],
-                                    [
-                                        (rect.x - target_rect.x) as f32,
-                                        (rect.y - target_rect.y) as f32,
-                                        0.0,
-                                        1.0,
+                        for blend in &blends {
+                            let rect = blend.rect;
+                            let transform_range = transforms
+                                .add(&[Transforms {
+                                    world_matrix: [
+                                        [rect.width as f32, 0.0, 0.0, 0.0],
+                                        [0.0, rect.height as f32, 0.0, 0.0],
+                                        [0.0, 0.0, 1.0, 0.0],
+                                        [
+                                            (rect.x - target_rect.x) as f32,
+                                            (rect.y - target_rect.y) as f32,
+                                            0.0,
+                                            1.0,
+                                        ],
                                     ],
-                                ],
-                                mult_color: [1.0, 1.0, 1.0, 1.0],
-                                add_color: [0.0, 0.0, 0.0, 0.0],
-                            }])
-                            .expect("A single transform always fits an empty builder");
-                        let vertex_range = vertices
-                            .add(&blend_quad(rect, parent.rect()))
-                            .expect("Four vertices always fit an empty builder");
+                                    // The blend shader has no colour transform
+                                    // of its own to apply, so this carries
+                                    // where the group's pixels are in the
+                                    // texture it reads them from: the whole of
+                                    // a target it had to itself, or one region
+                                    // of a shared page.
+                                    mult_color: blend.source_uv,
+                                    add_color: [0.0, 0.0, 0.0, 0.0],
+                                }])
+                                .expect("a batch is sized to fit the buffers");
+                            let vertex_range = vertices
+                                .add(&blend_quad(rect, parent.rect()))
+                                .expect("a batch is sized to fit the buffers");
+                            offsets.push((
+                                transform_range.start as wgpu::DynamicOffset,
+                                vertex_range.start,
+                            ));
+                        }
 
                         transforms.copy_to(staging_belt, draw_encoder, &dynamic_transforms.buffer);
                         vertices.copy_to(
@@ -320,53 +355,60 @@ impl Surface {
                             draw_encoder,
                             &dynamic_transforms.vertex_buffer,
                         );
-                        (
-                            transform_range.start as wgpu::DynamicOffset,
-                            vertex_range.start,
-                        )
-                    };
+                    }
 
                     // The destination a blend reads is the same one frame
                     // after frame, so the bind group pairing it with this
-                    // target is kept on the target rather than rebuilt.
-                    let blend_bind_group =
-                        texture.binds().paired(parent_blend_buffer.binds_id(), || {
-                            descriptors
-                                .device
-                                .create_bind_group(&wgpu::BindGroupDescriptor {
-                                    label: create_debug_label!("Complex blend binds").as_deref(),
-                                    layout: &descriptors.bind_layouts.blend,
-                                    entries: &[
-                                        wgpu::BindGroupEntry {
-                                            binding: 0,
-                                            resource: wgpu::BindingResource::TextureView(
-                                                parent_blend_buffer.view(),
-                                            ),
+                    // target is kept on the target rather than rebuilt. Every
+                    // group sharing a page shares the bind group too, and
+                    // picks its own region out of it with `source_uv`.
+                    let binds: Vec<wgpu::BindGroup> = blends
+                        .iter()
+                        .map(|blend| {
+                            blend
+                                .texture
+                                .binds()
+                                .paired(parent_blend_buffer.binds_id(), || {
+                                    descriptors.device.create_bind_group(
+                                        &wgpu::BindGroupDescriptor {
+                                            label: create_debug_label!("Complex blend binds")
+                                                .as_deref(),
+                                            layout: &descriptors.bind_layouts.blend,
+                                            entries: &[
+                                                wgpu::BindGroupEntry {
+                                                    binding: 0,
+                                                    resource: wgpu::BindingResource::TextureView(
+                                                        parent_blend_buffer.view(),
+                                                    ),
+                                                },
+                                                wgpu::BindGroupEntry {
+                                                    binding: 1,
+                                                    resource: wgpu::BindingResource::TextureView(
+                                                        blend.texture.view(),
+                                                    ),
+                                                },
+                                                wgpu::BindGroupEntry {
+                                                    binding: 2,
+                                                    resource: wgpu::BindingResource::Sampler(
+                                                        descriptors
+                                                            .bitmap_samplers
+                                                            .get_sampler(false, false),
+                                                    ),
+                                                },
+                                            ],
                                         },
-                                        wgpu::BindGroupEntry {
-                                            binding: 1,
-                                            resource: wgpu::BindingResource::TextureView(
-                                                texture.view(),
-                                            ),
-                                        },
-                                        wgpu::BindGroupEntry {
-                                            binding: 2,
-                                            resource: wgpu::BindingResource::Sampler(
-                                                descriptors
-                                                    .bitmap_samplers
-                                                    .get_sampler(false, false),
-                                            ),
-                                        },
-                                    ],
+                                    )
                                 })
-                        });
+                        })
+                        .collect();
 
                     crate::render_stats::record_render_pass();
+                    crate::render_stats::record_complex_batch(blends.len() as u64);
                     let mut render_pass =
                         draw_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: create_debug_label!(
-                                "Complex blend {:?} {}",
-                                blend_mode,
+                                "Complex blends x{} {}",
+                                blends.len(),
                                 if needs_stencil {
                                     "(with stencil)"
                                 } else {
@@ -397,32 +439,38 @@ impl Surface {
                                 render_pass.set_stencil_reference(num_masks);
                             }
                         }
-                        render_pass.set_pipeline(
-                            self.pipelines.complex_blends[blend_mode].pipeline_for(mask_state),
-                        );
-                    } else {
-                        render_pass.set_pipeline(
-                            self.pipelines.complex_blends[blend_mode].stencilless_pipeline(),
-                        );
                     }
-
-                    render_pass.set_bind_group(
-                        1,
-                        &dynamic_transforms.bind_group,
-                        &[transform_offset],
-                    );
-                    render_pass.set_bind_group(2, &blend_bind_group, &[]);
-
-                    render_pass.set_vertex_buffer(
-                        0,
-                        dynamic_transforms.vertex_buffer.slice(vertex_offset..),
-                    );
                     render_pass.set_index_buffer(
                         descriptors.quad.indices.slice(..),
                         wgpu::IndexFormat::Uint32,
                     );
 
-                    render_pass.draw_indexed(0..6, 0, 0..1);
+                    for ((blend, (transform_offset, vertex_offset)), bind_group) in
+                        blends.iter().zip(&offsets).zip(&binds)
+                    {
+                        if needs_stencil {
+                            render_pass.set_pipeline(
+                                self.pipelines.complex_blends[blend.blend_mode]
+                                    .pipeline_for(mask_state),
+                            );
+                        } else {
+                            render_pass.set_pipeline(
+                                self.pipelines.complex_blends[blend.blend_mode]
+                                    .stencilless_pipeline(),
+                            );
+                        }
+                        render_pass.set_bind_group(
+                            1,
+                            &dynamic_transforms.bind_group,
+                            &[*transform_offset],
+                        );
+                        render_pass.set_bind_group(2, bind_group, &[]);
+                        render_pass.set_vertex_buffer(
+                            0,
+                            dynamic_transforms.vertex_buffer.slice(*vertex_offset..),
+                        );
+                        render_pass.draw_indexed(0..6, 0, 0..1);
+                    }
                 }
             }
         }
@@ -444,6 +492,157 @@ impl Surface {
     pub fn size(&self) -> wgpu::Extent3d {
         self.rect.extent()
     }
+}
+
+/// One complex blend waiting to be composited.
+struct BlendItem {
+    /// The blended group's pixels: a target it had to itself, or the page it
+    /// shares with its siblings.
+    texture: Arc<PoolOrArcTexture>,
+    /// `[u0, v0, du, dv]`: which part of `texture` is this group's.
+    source_uv: [f32; 4],
+    blend_mode: ComplexBlend,
+    rect: TargetRect,
+}
+
+/// One render pass.
+enum Pass {
+    Draw {
+        chunk: Vec<commands::DrawCommand>,
+        needs_stencil: bool,
+        transforms: BufferBuilder,
+        vertices: BufferBuilder,
+    },
+    Shader {
+        texture: Arc<PoolOrArcTexture>,
+        shader: ruffle_render::pixel_bender::PixelBenderShaderHandle,
+        needs_stencil: bool,
+        rect: TargetRect,
+    },
+    /// Complex blends composited together.
+    Blends {
+        blends: Vec<BlendItem>,
+        needs_stencil: bool,
+        /// Whether these read the nearest layer above them - an `Alpha` or an
+        /// `Erase` - rather than the target they are drawn onto.
+        reads_layer: bool,
+    },
+}
+
+/// Whether two blends can be composited in the same pass.
+///
+/// A complex blend reads the destination underneath itself and writes over it,
+/// so two of them that cover the same pixels have to be ordered: the second has
+/// to see what the first wrote. Two that cover no pixel in common cannot see
+/// each other's work at all, so drawing them together off one snapshot of the
+/// destination gives exactly the picture drawing them one at a time gives.
+///
+/// A pixel of slack on each side, because a blend samples the destination
+/// through the same rectangle it covers and the fragments at its edge can round
+/// into the neighbouring texel - which is why [`sample_region`] copies a pixel
+/// more than the blend covers.
+fn can_share_a_pass(a: TargetRect, b: TargetRect) -> bool {
+    a.right() + 1 <= b.x - 1
+        || b.right() + 1 <= a.x - 1
+        || a.bottom() + 1 <= b.y - 1
+        || b.bottom() + 1 <= a.y - 1
+}
+
+/// The most blends one pass can hold, which is what a chunk's buffers can
+/// describe: an aligned slot each in the uniform buffer, and a quad each in the
+/// vertex buffer.
+fn max_batch(descriptors: &Descriptors, dynamic_transforms: &DynamicTransforms) -> usize {
+    if !crate::tuning::blend_batching_enabled() {
+        return 1;
+    }
+    let align = descriptors.limits.min_uniform_buffer_offset_alignment as u64;
+    let transform = std::mem::size_of::<Transforms>() as u64;
+    let stride = if align > 0 {
+        transform.div_ceil(align) * align
+    } else {
+        transform
+    };
+    let by_transforms = dynamic_transforms.buffer.size() / stride.max(1);
+    let by_vertices =
+        dynamic_transforms.vertex_buffer.size() / (4 * std::mem::size_of::<PosUvVertex>() as u64);
+    by_transforms.min(by_vertices).max(1) as usize
+}
+
+/// Groups the chunks into render passes, putting consecutive complex blends
+/// that cannot see each other's work into one.
+///
+/// Order is never changed. A blend joins the batch being built only if it
+/// shares no pixel with anything already in it, so within a batch no blend
+/// depends on another, and batches run in the order their blends were given.
+fn batch_passes(chunks: Vec<Chunk>, max_batch: usize, nearest_layer: LayerRef) -> Vec<Pass> {
+    let mut passes: Vec<Pass> = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        match chunk {
+            Chunk::Draw {
+                chunk,
+                needs_stencil,
+                transforms,
+                vertices,
+            } => passes.push(Pass::Draw {
+                chunk,
+                needs_stencil,
+                transforms,
+                vertices,
+            }),
+            Chunk::Blend {
+                texture,
+                source_uv: _,
+                blend_mode: ChunkBlendMode::Shader(shader),
+                needs_stencil,
+                rect,
+            } => passes.push(Pass::Shader {
+                texture,
+                shader,
+                needs_stencil,
+                rect,
+            }),
+            Chunk::Blend {
+                texture,
+                source_uv,
+                blend_mode: ChunkBlendMode::Complex(blend_mode),
+                needs_stencil,
+                rect,
+            } => {
+                let reads_layer = matches!(blend_mode, ComplexBlend::Alpha | ComplexBlend::Erase);
+                // An Alpha or Erase with no Layer above it should be ignored.
+                if reads_layer && matches!(nearest_layer, LayerRef::None) {
+                    continue;
+                }
+                let item = BlendItem {
+                    texture,
+                    source_uv,
+                    blend_mode,
+                    rect,
+                };
+                if let Some(Pass::Blends {
+                    blends,
+                    needs_stencil: batch_stencil,
+                    reads_layer: batch_layer,
+                }) = passes.last_mut()
+                    && *batch_stencil == needs_stencil
+                    && *batch_layer == reads_layer
+                    && blends.len() < max_batch
+                    && blends
+                        .iter()
+                        .all(|other| can_share_a_pass(other.rect, item.rect))
+                {
+                    blends.push(item);
+                    continue;
+                }
+                passes.push(Pass::Blends {
+                    blends: vec![item],
+                    needs_stencil,
+                    reads_layer,
+                });
+            }
+        }
+    }
+    passes
 }
 
 /// The four corners of the quad a complex blend draws.

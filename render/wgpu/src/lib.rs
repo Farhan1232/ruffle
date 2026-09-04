@@ -444,6 +444,117 @@ pub mod render_stats {
         LAST_FRAME_RENDER_PASSES.store(passes, Ordering::Relaxed);
         PEAK_BLEND_TARGETS.fetch_max(targets, Ordering::Relaxed);
         PEAK_BLEND_TARGET_BYTES.fetch_max(bytes, Ordering::Relaxed);
+
+        let pages = FRAME_PAGES.swap(0, Ordering::Relaxed);
+        let page_bytes = FRAME_PAGE_BYTES.swap(0, Ordering::Relaxed);
+        PAGES_LAST_FRAME.store(pages, Ordering::Relaxed);
+        PAGE_BYTES_LAST_FRAME.store(page_bytes, Ordering::Relaxed);
+        PEAK_PAGE_BYTES.fetch_max(page_bytes, Ordering::Relaxed);
+        DESTINATION_COPIES_LAST_FRAME.store(
+            FRAME_DESTINATION_COPIES.swap(0, Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        DESTINATION_COPY_PIXELS_LAST_FRAME.store(
+            FRAME_DESTINATION_COPY_PIXELS.swap(0, Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Why a blended group could not share a page with its siblings.
+    ///
+    /// Separate from [`FallbackReason`], which is about the direct path: a
+    /// group that cannot be drawn straight onto its destination may still be
+    /// perfectly able to share a page, and these say which of the two it
+    /// missed.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum PageFallback {
+        /// A `PixelBender` blend, which is arbitrary code over its whole quad.
+        Shader,
+        /// The group draws another blended group of its own.
+        NestedBlend,
+        /// The group contains an alpha mask, which needs targets of its own.
+        AlphaMask,
+        /// The group pushes a stencil mask, which a shared pass has no
+        /// per-region state for.
+        Masked,
+        /// Stage3D, which is drawn through its own pipelines.
+        Stage3D,
+        /// Bigger than a page region is allowed to be.
+        Size,
+        /// The group's draws do not fit one chunk's uniform or vertex buffer.
+        Capacity,
+        /// No page could be opened for it.
+        NoPage,
+    }
+
+    pub const PAGE_FALLBACK_NAMES: &[&str] = &[
+        "shader",
+        "nested_blend",
+        "alpha_mask",
+        "masked",
+        "stage3d",
+        "size",
+        "capacity",
+        "no_page",
+    ];
+
+    static PAGE_FALLBACKS: [AtomicU64; 8] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+
+    static BATCH_ELIGIBLE: AtomicU64 = AtomicU64::new(0);
+    static BATCH_USED: AtomicU64 = AtomicU64::new(0);
+    static FRAME_PAGES: AtomicUsize = AtomicUsize::new(0);
+    static FRAME_PAGE_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static PAGES_LAST_FRAME: AtomicUsize = AtomicUsize::new(0);
+    static PAGE_BYTES_LAST_FRAME: AtomicUsize = AtomicUsize::new(0);
+    static PEAK_PAGE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+    /// A blended group was offered a page, and either took a region on one or
+    /// did not.
+    pub(crate) fn record_batch(used: bool, reason: Option<PageFallback>) {
+        BATCH_ELIGIBLE.fetch_add(1, Ordering::Relaxed);
+        if used {
+            BATCH_USED.fetch_add(1, Ordering::Relaxed);
+        } else if let Some(reason) = reason {
+            PAGE_FALLBACKS[reason as usize].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A page of `bytes` has been taken for this frame.
+    pub(crate) fn page_taken(bytes: usize) {
+        FRAME_PAGES.fetch_add(1, Ordering::Relaxed);
+        FRAME_PAGE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    static DESTINATION_COPIES: AtomicU64 = AtomicU64::new(0);
+    static DESTINATION_COPY_PIXELS: AtomicU64 = AtomicU64::new(0);
+    static FRAME_DESTINATION_COPIES: AtomicU64 = AtomicU64::new(0);
+    static FRAME_DESTINATION_COPY_PIXELS: AtomicU64 = AtomicU64::new(0);
+    static DESTINATION_COPIES_LAST_FRAME: AtomicU64 = AtomicU64::new(0);
+    static DESTINATION_COPY_PIXELS_LAST_FRAME: AtomicU64 = AtomicU64::new(0);
+    static COMPLEX_BLENDS: AtomicU64 = AtomicU64::new(0);
+    static COMPLEX_BLEND_PASSES: AtomicU64 = AtomicU64::new(0);
+
+    /// A complex blend has taken a snapshot of the destination it reads.
+    pub(crate) fn record_destination_copy(pixels: u64) {
+        DESTINATION_COPIES.fetch_add(1, Ordering::Relaxed);
+        DESTINATION_COPY_PIXELS.fetch_add(pixels, Ordering::Relaxed);
+        FRAME_DESTINATION_COPIES.fetch_add(1, Ordering::Relaxed);
+        FRAME_DESTINATION_COPY_PIXELS.fetch_add(pixels, Ordering::Relaxed);
+    }
+
+    /// `blends` complex blends were composited in one render pass.
+    pub(crate) fn record_complex_batch(blends: u64) {
+        COMPLEX_BLENDS.fetch_add(blends, Ordering::Relaxed);
+        COMPLEX_BLEND_PASSES.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_fastpath(used: bool, reason: Option<FallbackReason>) {
@@ -472,6 +583,24 @@ pub mod render_stats {
         pub fallbacks: Vec<u64>,
         /// Render passes encoded for the most recent frame.
         pub render_passes_last_frame: u64,
+        /// Blended groups offered a shared page, and the ones that took a
+        /// region on one.
+        pub batch_eligible: u64,
+        pub batch_used: u64,
+        /// Why the rest did not, indexed by [`PageFallback`].
+        pub page_fallbacks: Vec<u64>,
+        /// Pages taken for the most recent frame, and what they cost.
+        pub pages_last_frame: usize,
+        pub page_bytes_last_frame: usize,
+        pub peak_page_bytes: usize,
+        /// Snapshots complex blends took of the destination they read.
+        pub destination_copies: u64,
+        pub destination_copy_pixels: u64,
+        pub destination_copies_last_frame: u64,
+        pub destination_copy_pixels_last_frame: u64,
+        /// Complex blends composited, and the render passes that took them.
+        pub complex_blends: u64,
+        pub complex_blend_passes: u64,
         /// Where the renderer's share of the frames went.
         pub timing: FrameTiming,
     }
@@ -493,6 +622,22 @@ pub mod render_stats {
                 .map(|c| c.load(Ordering::Relaxed))
                 .collect(),
             render_passes_last_frame: LAST_FRAME_RENDER_PASSES.load(Ordering::Relaxed),
+            batch_eligible: BATCH_ELIGIBLE.load(Ordering::Relaxed),
+            batch_used: BATCH_USED.load(Ordering::Relaxed),
+            page_fallbacks: PAGE_FALLBACKS
+                .iter()
+                .map(|c| c.load(Ordering::Relaxed))
+                .collect(),
+            pages_last_frame: PAGES_LAST_FRAME.load(Ordering::Relaxed),
+            page_bytes_last_frame: PAGE_BYTES_LAST_FRAME.load(Ordering::Relaxed),
+            peak_page_bytes: PEAK_PAGE_BYTES.load(Ordering::Relaxed),
+            destination_copies: DESTINATION_COPIES.load(Ordering::Relaxed),
+            destination_copy_pixels: DESTINATION_COPY_PIXELS.load(Ordering::Relaxed),
+            destination_copies_last_frame: DESTINATION_COPIES_LAST_FRAME.load(Ordering::Relaxed),
+            destination_copy_pixels_last_frame: DESTINATION_COPY_PIXELS_LAST_FRAME
+                .load(Ordering::Relaxed),
+            complex_blends: COMPLEX_BLENDS.load(Ordering::Relaxed),
+            complex_blend_passes: COMPLEX_BLEND_PASSES.load(Ordering::Relaxed),
             timing: FrameTiming {
                 total_ns: SUBMIT_NS.load(Ordering::Relaxed),
                 cache_entries_ns: CACHE_ENTRIES_NS.load(Ordering::Relaxed),
@@ -508,7 +653,39 @@ pub mod render_stats {
     }
 }
 
-pub use render_stats::{FallbackReason, FrameTiming, RenderStats, render_stats};
+pub use render_stats::{FallbackReason, FrameTiming, PageFallback, RenderStats, render_stats};
+
+/// Switches for the two ways a frame's blended groups are batched.
+///
+/// Both are on. They are here so that the same scene can be rendered with and
+/// without them and the two pictures compared pixel for pixel, which is how the
+/// batching is tested; and so that, if a driver in the field ever disagrees,
+/// there is a way to render the old way without a new build.
+pub mod tuning {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static BLEND_PAGES: AtomicBool = AtomicBool::new(true);
+    static BLEND_BATCHING: AtomicBool = AtomicBool::new(true);
+
+    /// Whether blended groups share pages instead of each taking a target.
+    pub fn blend_pages_enabled() -> bool {
+        BLEND_PAGES.load(Ordering::Relaxed)
+    }
+
+    pub fn set_blend_pages_enabled(enabled: bool) {
+        BLEND_PAGES.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Whether complex blends that cannot see each other's work are composited
+    /// in one render pass.
+    pub fn blend_batching_enabled() -> bool {
+        BLEND_BATCHING.load(Ordering::Relaxed)
+    }
+
+    pub fn set_blend_batching_enabled(enabled: bool) {
+        BLEND_BATCHING.store(enabled, Ordering::Relaxed);
+    }
+}
 
 /// Approximate memory of a texture: its pixels at the format's block size.
 pub(crate) fn texture_bytes(texture: &wgpu::Texture) -> usize {

@@ -37,6 +37,26 @@ impl BufferBuilder {
         self.limit = limit;
     }
 
+    /// Whether `count` more values of `size` bytes each are certain to fit.
+    ///
+    /// A page renders many groups' commands through one pair of builders, and
+    /// splitting a group's draws across two of them would put half of it in a
+    /// different render pass; asking first is what lets a group that does not
+    /// fit start a fresh page instead. The answer is worst-case: every value is
+    /// assumed to need a whole aligned stride.
+    pub fn has_room_for(&self, count: usize, size: usize) -> bool {
+        let stride = (size + self.align_mask) & !self.align_mask;
+        let start = if self.inner.is_empty() {
+            0
+        } else {
+            (self.inner.len() + self.align_mask) & !self.align_mask
+        };
+        match count.checked_mul(stride).and_then(|n| n.checked_add(start)) {
+            Some(end) => end as u64 <= self.limit,
+            None => false,
+        }
+    }
+
     pub fn add<T: NoUninit + AnyBitPattern>(
         &mut self,
         value: &[T],

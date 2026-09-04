@@ -2,12 +2,13 @@ use super::target::PoolOrArcTexture;
 use crate::backend::RenderTargetMode;
 use crate::blend::TrivialBlend;
 use crate::blend::{BlendType, ComplexBlend};
-use crate::bounds::{TargetRect, content_bounds, target_rect_for};
+use crate::bounds::{TargetRect, content_bounds, region_rect_for, target_rect_for};
 use crate::buffer_builder::BufferBuilder;
 use crate::buffer_pool::TexturePool;
 use crate::dynamic_transforms::DynamicTransforms;
 use crate::mesh::{DrawType, Mesh, as_mesh};
 use crate::surface::Surface;
+use crate::surface::page::{BlendPages, PageRegion};
 use crate::surface::target::CommandTarget;
 use crate::{Descriptors, MaskState, Pipelines, PosUvVertex, Transforms, as_texture};
 use ruffle_render::backend::ShapeHandle;
@@ -19,6 +20,7 @@ use ruffle_render::pixel_bender::PixelBenderShaderHandle;
 use ruffle_render::quality::StageQuality;
 use ruffle_render::transform::Transform;
 use std::mem;
+use std::sync::Arc;
 use swf::{BlendMode, Color, ColorTransform, Twips};
 use wgpu::Backend;
 use wgpu_profiler::Scope;
@@ -93,8 +95,15 @@ impl<'encoder> CommandRenderer<'encoder> {
                 _texture,
                 binds,
                 transform_buffer,
+                vertex_offset,
                 blend_mode,
-            } => self.render_texture(render_pass, *transform_buffer, binds, *blend_mode),
+            } => self.render_texture(
+                render_pass,
+                *transform_buffer,
+                binds,
+                *blend_mode,
+                *vertex_offset,
+            ),
             DrawCommand::RenderShape {
                 shape,
                 transform_buffer,
@@ -249,14 +258,23 @@ impl<'encoder> CommandRenderer<'encoder> {
         transform_buffer: wgpu::DynamicOffset,
         bind_group: &'encoder wgpu::BindGroup,
         blend_mode: TrivialBlend,
+        vertex_offset: Option<wgpu::BufferAddress>,
     ) {
         self.prep_bitmap(render_pass, bind_group, blend_mode, false);
 
         render_pass.set_bind_group(1, &self.dynamic_transforms.bind_group, &[transform_buffer]);
 
+        // A group that had a target to itself samples all of it, which is what
+        // the shared quad's texture coordinates say. One that took a region of
+        // a page brings its own, naming the region.
+        let vertices = match vertex_offset {
+            Some(offset) => self.dynamic_transforms.vertex_buffer.slice(offset..),
+            None => self.descriptors.quad.vertices_pos_uv.slice(..),
+        };
+
         self.draw(
             render_pass,
-            self.descriptors.quad.vertices_pos_uv.slice(..),
+            vertices,
             self.descriptors.quad.indices.slice(..),
             6,
         );
@@ -419,7 +437,12 @@ pub enum Chunk {
         vertices: BufferBuilder,
     },
     Blend {
-        texture: PoolOrArcTexture,
+        /// The blended group's pixels. Shared, because a page holds the pixels
+        /// of many groups and each of them composites separately.
+        texture: Arc<PoolOrArcTexture>,
+        /// `[u0, v0, du, dv]`: which part of `texture` is this group's.
+        /// `[0.0, 0.0, 1.0, 1.0]` for a group that had a target to itself.
+        source_uv: [f32; 4],
         blend_mode: ChunkBlendMode,
         needs_stencil: bool,
         /// Where the blended group's target belongs, in the coordinates the
@@ -445,9 +468,14 @@ pub enum DrawCommand {
         render_stage3d: bool,
     },
     RenderTexture {
-        _texture: PoolOrArcTexture,
+        /// The target this was rendered through, when it had one to itself.
+        /// A region of a page is kept alive by the page instead.
+        _texture: Option<PoolOrArcTexture>,
         binds: wgpu::BindGroup,
         transform_buffer: wgpu::DynamicOffset,
+        /// The quad naming the part of `binds` to sample; the whole of it when
+        /// this is `None`.
+        vertex_offset: Option<wgpu::BufferAddress>,
         blend_mode: TrivialBlend,
     },
     RenderAlphaMask {
@@ -515,6 +543,17 @@ pub enum LayerRef<'a> {
     Parent(&'a CommandTarget),
 }
 
+/// The passes a command list has been broken into, and the pages they read.
+pub struct ChunkedCommands {
+    pub chunks: Vec<Chunk>,
+    /// The pages blended groups were rendered onto.
+    ///
+    /// Their passes are already encoded; these keep the pooled textures out of
+    /// circulation until the chunks that composite from them have been encoded
+    /// too, so that a later target cannot be handed a page and clear it first.
+    pub pages: Vec<Arc<PoolOrArcTexture>>,
+}
+
 /// Replaces every blend with a RenderBitmap, with the subcommands rendered out to a temporary texture
 /// Every complex blend will be its own item, but every other draw will be chunked together
 #[expect(clippy::too_many_arguments)]
@@ -529,7 +568,7 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
     rect: TargetRect,
     nearest_layer: LayerRef,
     texture_pool: &'encoder mut TexturePool,
-) -> Vec<Chunk> {
+) -> ChunkedCommands {
     WgpuCommandHandler::new(
         descriptors,
         staging_belt,
@@ -561,6 +600,8 @@ struct WgpuCommandHandler<'encoder, 'global: 'encoder> {
     draw_encoder: &'encoder mut Scope<'global, wgpu::CommandEncoder>,
     texture_pool: &'encoder mut TexturePool,
     emulate_lines: bool,
+    /// The pages this walk's blended groups are sharing.
+    pages: BlendPages,
 
     result: Vec<Chunk>,
     current: Vec<DrawCommand>,
@@ -568,6 +609,9 @@ struct WgpuCommandHandler<'encoder, 'global: 'encoder> {
     vertices: BufferBuilder,
     needs_stencil: bool,
     num_masks: i32,
+    /// Whether the draws being built belong to a page rather than to the
+    /// surface.
+    paging: bool,
 }
 
 impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
@@ -591,6 +635,19 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
         // Without MSAA, lines have 1px thickness, but their placement is sometimes off.
         let emulate_lines = descriptors.backend == Backend::Dx12;
 
+        // Blended groups are always rendered through `Rgba8Unorm` at the
+        // surface's quality, whatever the surface's own format is, so a page
+        // has to match that and not the surface.
+        let pages = BlendPages::new(
+            descriptors,
+            BLEND_TARGET_FORMAT,
+            crate::utils::supported_sample_count(
+                &descriptors.adapter,
+                quality.sample_count(),
+                BLEND_TARGET_FORMAT,
+            ),
+        );
+
         Self {
             descriptors,
             quality,
@@ -602,6 +659,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
             draw_encoder,
             texture_pool,
             emulate_lines,
+            pages,
 
             result: vec![],
             current: vec![],
@@ -609,6 +667,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
             vertices,
             needs_stencil: false,
             num_masks: 0,
+            paging: false,
         }
     }
 
@@ -632,8 +691,17 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
 
     /// Replaces every blend with a RenderBitmap, with the subcommands rendered out to a temporary texture
     /// Every complex blend will be its own item, but every other draw will be chunked together
-    fn chunk_blends(&mut self, commands: CommandList) -> Vec<Chunk> {
+    fn chunk_blends(&mut self, commands: CommandList) -> ChunkedCommands {
         commands.execute(self);
+
+        // Every page has to be drawn before anything composites from it, and
+        // every composite is in a chunk the caller has yet to execute.
+        self.pages.finish(
+            self.descriptors,
+            self.staging_belt,
+            self.dynamic_transforms,
+            self.draw_encoder,
+        );
 
         let current = mem::take(&mut self.current);
         let mut result = mem::take(&mut self.result);
@@ -656,7 +724,10 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
             });
         }
 
-        result
+        ChunkedCommands {
+            chunks: result,
+            pages: self.pages.take_held(),
+        }
     }
 
     /// Draws a bitmap with an explicit blend state.
@@ -709,6 +780,136 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
         );
     }
 
+    /// Renders a blended group onto a shared page and composites it from there.
+    ///
+    /// Gives the group's commands back if it could not: it is then rendered
+    /// through a target of its own, exactly as before.
+    fn blend_through_page(
+        &mut self,
+        commands: CommandList,
+        blend_type: &BlendType,
+    ) -> Result<(), CommandList> {
+        if !crate::tuning::blend_pages_enabled() {
+            return Err(commands);
+        }
+        if let Err(reason) = page_eligible(&commands, blend_type) {
+            crate::render_stats::record_batch(false, Some(reason));
+            return Err(commands);
+        }
+
+        // A page region is not a pool key, so it is the content's own size
+        // rather than a size class - a third less area for an avatar.
+        let rect = region_rect_for(content_bounds(&commands), self.rect);
+        let (transforms, vertices) = page_reserve(&commands, self.emulate_lines);
+        let placement = match self.pages.place(
+            self.descriptors,
+            self.texture_pool,
+            self.staging_belt,
+            self.dynamic_transforms,
+            self.draw_encoder,
+            rect.width,
+            rect.height,
+            transforms,
+            vertices,
+        ) {
+            Ok(placement) => placement,
+            Err(reason) => {
+                crate::render_stats::record_batch(false, Some(reason));
+                return Err(commands);
+            }
+        };
+        crate::render_stats::record_batch(true, None);
+        let region = placement.region;
+
+        self.draw_into_region(commands, rect, region);
+
+        match blend_type {
+            BlendType::Trivial(blend_mode) => {
+                let blend_mode = *blend_mode;
+                let binds = placement.binds;
+                let quad = region.quad();
+                self.add_to_current_with_vertices(
+                    rect_matrix(rect),
+                    Default::default(),
+                    Some(&quad),
+                    |transform_buffer, vertex_offset| DrawCommand::RenderTexture {
+                        _texture: None,
+                        binds,
+                        transform_buffer,
+                        vertex_offset,
+                        blend_mode,
+                    },
+                );
+            }
+            BlendType::Complex(complex) => {
+                self.flush_current();
+                self.result.push(Chunk::Blend {
+                    texture: placement.source,
+                    source_uv: region.uv(),
+                    blend_mode: ChunkBlendMode::Complex(*complex),
+                    needs_stencil: self.num_masks > 0,
+                    rect,
+                });
+                self.needs_stencil = self.num_masks > 0;
+            }
+            BlendType::Shader(_) => unreachable!("a shader blend is never page-eligible"),
+        }
+        Ok(())
+    }
+
+    /// Draws a blended group's commands into its region of a page.
+    ///
+    /// The handler's own state is lent to the group for the walk: its draws go
+    /// into the page's buffers rather than the surface's, and its world
+    /// matrices have the region's origin put back on, so that an object at
+    /// `x = 100.37` lands `.37` into the region just as it landed `.37` into a
+    /// target of its own.
+    fn draw_into_region(&mut self, commands: CommandList, rect: TargetRect, region: PageRegion) {
+        let saved_rect = mem::replace(
+            &mut self.rect,
+            TargetRect {
+                x: rect.x - region.x as i32,
+                y: rect.y - region.y as i32,
+                width: region.page_width,
+                height: region.page_height,
+            },
+        );
+        let saved_current = mem::take(&mut self.current);
+        let saved_needs_stencil = mem::replace(&mut self.needs_stencil, false);
+        self.pages
+            .swap_builders(&mut self.transforms, &mut self.vertices);
+        let saved_paging = mem::replace(&mut self.paging, true);
+
+        commands.execute(self);
+
+        self.paging = saved_paging;
+        self.pages
+            .swap_builders(&mut self.transforms, &mut self.vertices);
+        let run = mem::replace(&mut self.current, saved_current);
+        self.rect = saved_rect;
+        self.needs_stencil = saved_needs_stencil;
+        self.pages.add_run(region, run);
+    }
+
+    /// Closes the chunk being built, if there is anything in it.
+    fn flush_current(&mut self) {
+        if self.current.is_empty() {
+            return;
+        }
+        self.result.push(Chunk::Draw {
+            chunk: mem::take(&mut self.current),
+            needs_stencil: self.needs_stencil,
+            transforms: mem::replace(
+                &mut self.transforms,
+                Self::new_transforms(self.descriptors, self.dynamic_transforms),
+            ),
+            vertices: mem::replace(
+                &mut self.vertices,
+                Self::new_vertices(self.descriptors, self.dynamic_transforms),
+            ),
+        });
+    }
+
     fn add_to_current(
         &mut self,
         matrix: Matrix,
@@ -753,6 +954,14 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
                 vertices_range.map(|v| v.start),
             ));
         } else {
+            // A group being drawn onto a page had room reserved for all of it
+            // before the region was handed out, so this cannot be reached from
+            // there - and must not be, because the chunk would be drawn onto
+            // the surface rather than onto the page.
+            debug_assert!(
+                !self.paging,
+                "a paged group overflowed the buffers reserved for it"
+            );
             self.result.push(Chunk::Draw {
                 chunk: mem::take(&mut self.current),
                 needs_stencil: self.needs_stencil,
@@ -780,6 +989,83 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
             ));
         }
     }
+}
+
+/// The format every blended group is rendered through, whatever the surface it
+/// is composited onto is.
+const BLEND_TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+/// The source rectangle of a group that has a whole texture to itself.
+pub const WHOLE_TEXTURE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+
+/// Whether a blended group can share a page with its siblings instead of taking
+/// a render target of its own, and if not, why not.
+///
+/// A page draws every group on it in one render pass, scissored to each group's
+/// own region, so a group can only join if its commands are a plain run of
+/// draws: anything that would want a pass or a target *inside* the shared one -
+/// a nested blend, an alpha mask, a stencil mask - keeps its own target, where
+/// the existing code can give it one.
+///
+/// This is a wider door than [`trivial_fast_path`]: that one needs a group of
+/// exactly one drawable under a blend state that cannot saturate, because it
+/// draws the group's contents straight onto the destination. A page still
+/// composites the group as a unit through a texture, so the group may have as
+/// many children as it likes and any blend mode that is not arbitrary code.
+fn page_eligible(
+    commands: &CommandList,
+    blend_type: &BlendType,
+) -> Result<(), crate::PageFallback> {
+    use crate::PageFallback;
+
+    // A `PixelBender` blend is arbitrary code that may write anywhere its quad
+    // covers, so it keeps the full-sized target it is given.
+    if matches!(blend_type, BlendType::Shader(_)) {
+        return Err(PageFallback::Shader);
+    }
+
+    for command in &commands.commands {
+        match command {
+            Command::RenderBitmap { .. }
+            | Command::RenderShape { .. }
+            | Command::DrawRect { .. }
+            | Command::DrawLine { .. }
+            | Command::DrawLineRect { .. } => {}
+            Command::Blend(..) => return Err(PageFallback::NestedBlend),
+            Command::RenderAlphaMask { .. } => return Err(PageFallback::AlphaMask),
+            Command::PushMask
+            | Command::ActivateMask
+            | Command::DeactivateMask
+            | Command::PopMask => return Err(PageFallback::Masked),
+            Command::RenderStage3D { .. } => return Err(PageFallback::Stage3D),
+        }
+    }
+
+    Ok(())
+}
+
+/// What a page-eligible group will need of a chunk's buffers, exactly.
+///
+/// Every draw takes one aligned slot in the uniform buffer, and the ones that
+/// carry their own quad take four vertices. A group is only put on a page once
+/// there is certainly room for all of it, because a run split between two
+/// buffers would be split between two render passes and half of it would land
+/// on the wrong page.
+fn page_reserve(commands: &CommandList, emulate_lines: bool) -> (usize, usize) {
+    let mut transforms = 0;
+    let mut vertices = 0;
+    for command in &commands.commands {
+        match command {
+            Command::RenderBitmap { .. } => {
+                transforms += 1;
+                vertices += 4;
+            }
+            // A rectangle of emulated lines becomes four rectangles.
+            Command::DrawLineRect { .. } if emulate_lines => transforms += 4,
+            _ => transforms += 1,
+        }
+    }
+    (transforms, vertices)
 }
 
 /// Whether a blended group can be drawn straight onto its destination instead
@@ -897,6 +1183,14 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
             Err(reason) => crate::render_stats::record_fastpath(false, Some(reason)),
         }
 
+        // A group that is a plain run of draws can share a page with its
+        // siblings instead of taking a target, a render pass and a pool entry
+        // of its own.
+        let commands = match self.blend_through_page(commands, &blend_type) {
+            Ok(()) => return,
+            Err(commands) => commands,
+        };
+
         // Every built-in blend leaves the destination untouched where the
         // blended group is transparent - the complex-blend shaders `discard`
         // there, and each trivial blend state is the identity on the
@@ -955,35 +1249,24 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
                     transform.matrix,
                     transform.color_transform,
                     |transform_buffer| DrawCommand::RenderTexture {
-                        _texture: texture,
+                        _texture: Some(texture),
                         binds: bind_group,
                         transform_buffer,
+                        vertex_offset: None,
                         blend_mode,
                     },
                 );
             }
             blend_type => {
-                if !self.current.is_empty() {
-                    self.result.push(Chunk::Draw {
-                        chunk: mem::take(&mut self.current),
-                        needs_stencil: self.needs_stencil,
-                        transforms: mem::replace(
-                            &mut self.transforms,
-                            Self::new_transforms(self.descriptors, self.dynamic_transforms),
-                        ),
-                        vertices: mem::replace(
-                            &mut self.vertices,
-                            Self::new_vertices(self.descriptors, self.dynamic_transforms),
-                        ),
-                    });
-                }
+                self.flush_current();
                 let chunk_blend_mode = match blend_type {
                     BlendType::Complex(complex) => ChunkBlendMode::Complex(complex),
                     BlendType::Shader(shader) => ChunkBlendMode::Shader(shader),
                     _ => unreachable!(),
                 };
                 self.result.push(Chunk::Blend {
-                    texture: target.take_color_texture(),
+                    texture: Arc::new(target.take_color_texture()),
+                    source_uv: WHOLE_TEXTURE,
                     blend_mode: chunk_blend_mode,
                     needs_stencil: self.num_masks > 0,
                     rect,

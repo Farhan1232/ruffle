@@ -19,7 +19,13 @@ struct VertexOutput {
 @vertex
 fn main_vertex(in: common__VertexInputUv) -> VertexOutput {
     let pos = common__globals.view_matrix * transforms.world_matrix * vec4<f32>(in.position.x, in.position.y, 1.0, 1.0);
-    return VertexOutput(pos, in.uv.xy / in.uv.z, in.position);
+    // The group's pixels may be a region of a page shared with its siblings
+    // rather than a texture of its own, so where to sample them is passed in
+    // rather than assumed to be the whole texture. `transforms.mult_color` is
+    // `[u0, v0, du, dv]`; a whole texture is `[0, 0, 1, 1]`, which gives back
+    // the quad's own coordinates.
+    let current_uv = transforms.mult_color.xy + in.position * transforms.mult_color.zw;
+    return VertexOutput(pos, in.uv.xy / in.uv.z, current_uv);
 }
 
 @fragment

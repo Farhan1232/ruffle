@@ -398,6 +398,24 @@ pub fn size_class(size: u32) -> u32 {
 /// so that what is drawn into it keeps the sub-pixel phase it would have had on
 /// screen, and stay inside `parent`, which is all that will ever be seen of it.
 pub fn target_rect_for(content: PixelRect, parent: TargetRect) -> TargetRect {
+    rect_for(content, parent, size_class)
+}
+
+/// The same rectangle for a group that will be given a region of a shared page
+/// rather than a target of its own.
+///
+/// A page region is not a pool key, so there is nothing to be gained by
+/// rounding it onto a size class and a third of the area to be lost by doing
+/// so: an avatar wants 150x200 and a size-classed target gives it 192x256. The
+/// two are otherwise interchangeable, because a target is cleared to
+/// transparent outside what its commands draw and every way one is consumed
+/// leaves the destination alone where it is transparent - which is the same
+/// argument that let the target shrink to the content in the first place.
+pub fn region_rect_for(content: PixelRect, parent: TargetRect) -> TargetRect {
+    rect_for(content, parent, |size| size.max(1))
+}
+
+fn rect_for(content: PixelRect, parent: TargetRect, round: impl Fn(u32) -> u32) -> TargetRect {
     let content = content.snap_out().intersect(parent.as_pixel_rect());
     let (content_x, content_y, content_width, content_height) = if content.is_empty() {
         // Nothing to draw - a group that is entirely off-screen, or masked away.
@@ -414,8 +432,8 @@ pub fn target_rect_for(content: PixelRect, parent: TargetRect) -> TargetRect {
         )
     };
 
-    let width = size_class(content_width as u32).clamp(1, parent.width.max(1));
-    let height = size_class(content_height as u32).clamp(1, parent.height.max(1));
+    let width = round(content_width as u32).clamp(1, parent.width.max(1));
+    let height = round(content_height as u32).clamp(1, parent.height.max(1));
 
     // Slide the target back inside the parent if rounding pushed it over the
     // edge. `width` is never less than the content's width and never more than
@@ -495,6 +513,68 @@ mod tests {
     fn full_screen_content_keeps_the_full_size_target() {
         let rect = target_rect_for(PixelRect::new(0.0, 0.0, 1920.0, 985.0), VIEWPORT);
         assert_eq!(rect, VIEWPORT);
+    }
+
+    /// A region of a page is the content and nothing more: it is not a pool
+    /// key, so the size class would only be wasted area.
+    #[test]
+    fn a_region_is_the_content_and_nothing_more() {
+        let content = PixelRect::new(800.0, 400.0, 950.0, 600.0);
+        let region = region_rect_for(content, VIEWPORT);
+        assert_eq!(
+            region,
+            TargetRect {
+                x: 800,
+                y: 400,
+                width: 150,
+                height: 200
+            }
+        );
+        // And it is inside the size-classed target it stands in for, so
+        // everything the target would have covered, the region covers too.
+        let target = target_rect_for(content, VIEWPORT);
+        assert!(
+            target.x <= region.x
+                && target.y <= region.y
+                && target.right() >= region.right()
+                && target.bottom() >= region.bottom(),
+            "{region:?} is not inside {target:?}"
+        );
+    }
+
+    /// Whatever else it does, a region has to contain everything the commands
+    /// can draw - the same promise the target makes.
+    #[test]
+    fn the_region_covers_the_content() {
+        let cases = [
+            PixelRect::new(0.0, 0.0, 1920.0, 985.0),
+            PixelRect::new(-500.0, -500.0, 40.0, 40.0),
+            PixelRect::new(1900.0, 960.0, 2400.0, 1200.0),
+            PixelRect::new(1919.5, 984.5, 1920.5, 985.5),
+            PixelRect::new(0.25, 0.25, 0.75, 0.75),
+            PixelRect::new(600.0, 300.0, 600.0, 700.0),
+        ];
+        for content in cases {
+            let rect = region_rect_for(content, VIEWPORT);
+            let visible = content.snap_out().intersect(VIEWPORT.as_pixel_rect());
+            assert!(
+                rect.x >= VIEWPORT.x
+                    && rect.y >= VIEWPORT.y
+                    && rect.right() <= VIEWPORT.right()
+                    && rect.bottom() <= VIEWPORT.bottom(),
+                "{rect:?} leaves the viewport for {content:?}"
+            );
+            assert!(rect.width >= 1 && rect.height >= 1, "{rect:?} is empty");
+            if !visible.is_empty() {
+                assert!(
+                    rect.x as f32 <= visible.x_min
+                        && rect.y as f32 <= visible.y_min
+                        && rect.right() as f32 >= visible.x_max
+                        && rect.bottom() as f32 >= visible.y_max,
+                    "{rect:?} does not cover {visible:?}"
+                );
+            }
+        }
     }
 
     /// Sizes have to collapse onto a handful of classes, or the pool would hold
