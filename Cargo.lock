@@ -5148,6 +5148,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruffle_soak"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "futures",
+ "ruffle_core",
+ "ruffle_render",
+ "ruffle_render_wgpu",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "ruffle_socket_format"
 version = "0.5.0"
 dependencies = [
