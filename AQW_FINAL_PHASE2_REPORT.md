@@ -509,6 +509,14 @@ when the build, the clean checkout and every required column check out. If it
 prints `RUNTIME: CHECKS FAILED`, the figures above it are not this build's and
 the run has to be repeated.
 
+There is no PowerShell on the machine this was written on, so the script could
+not be *executed* here. What was done instead: the diagnostic build was run and
+made to write a real CSV, and every column the script requires (81 of them) and
+every column it prints was checked against that file programmatically. Two unit
+tests keep it that way - the header and the rows must have the same number of
+fields, and the columns the verifier reads must exist. The first time it is run
+on Windows, read its output before trusting the run.
+
 Files to send back, all from `$HOME\Desktop\aqw-final`:
 
 * `build-info.txt`
