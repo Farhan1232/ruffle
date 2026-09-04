@@ -203,6 +203,9 @@ pub struct RenderWorkUsage {
     pub render_ns_total: u64,
     pub render_ns_cache_entries: u64,
     pub render_ns_frame_commands: u64,
+    /// Includes waiting for the display to accept the frame, so a large share
+    /// here means the GPU or the presentation queue could not keep up, not
+    /// that the CPU was busy. `render_ns_frame_commands` is the CPU encode.
     pub render_ns_queue_submit: u64,
     /// Frames whose *rendering* alone missed the 41.67 ms budget, and those
     /// that took over 100 ms, with where their time went.
