@@ -17,7 +17,7 @@ use crate::context::UpdateContext;
 
 /// Identifies this instrumentation, so a log can be tied to the build that
 /// produced it. Bump it whenever the columns change.
-pub const INSTRUMENTATION_VERSION: &str = "aqw-gpu-diag-2-pooltrim";
+pub const INSTRUMENTATION_VERSION: &str = "aqw-blend-bounds-1";
 
 /// What a single still-resident movie is keeping alive.
 #[derive(Debug, Clone)]

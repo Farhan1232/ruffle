@@ -7,11 +7,16 @@ param(
 
 New-Item -ItemType Directory -Force -Path (Split-Path $Out) | Out-Null
 
-$branch = git rev-parse --abbrev-ref HEAD
-$commit = git rev-parse HEAD
-$dirty  = if ((git status --porcelain)) { "MODIFIED - not a clean checkout" } else { "clean" }
-$item   = Get-Item $Exe
-$sha    = (Get-FileHash $Exe -Algorithm SHA256).Hash
+$branch  = git rev-parse --abbrev-ref HEAD
+$commit  = git rev-parse HEAD
+$subject = git log -1 --pretty=%s
+$dirty   = if ((git status --porcelain)) { "MODIFIED - not a clean checkout" } else { "clean" }
+$item    = Get-Item $Exe
+$sha     = (Get-FileHash $Exe -Algorithm SHA256).Hash
+# Read the instrumentation tag out of the source that is actually checked out,
+# rather than repeating it here where it can go stale.
+$instr   = (Select-String -Path .\core\src\memory_report.rs `
+              -Pattern 'INSTRUMENTATION_VERSION: &str = "([^"]+)"').Matches[0].Groups[1].Value
 
 @"
 === AQW GPU MEMORY DIAGNOSTIC BUILD ===
@@ -20,9 +25,8 @@ repo         : https://github.com/Farhan1232/ruffle.git
 branch       : $branch
 commit       : $commit
 worktree     : $dirty
-instrument   : aqw-gpu-diag-2-pooltrim
-fix commit   : 140979e2948473d320dc2abc97974f8ccb52d836
-fix parent   : 25401e81e3f736fc8efb67ce76c14cce6a2bce2e
+instrument   : $instr
+head subject : $subject
 exe path     : $($item.FullName)
 exe modified : $($item.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'))
 exe size     : $($item.Length) bytes
