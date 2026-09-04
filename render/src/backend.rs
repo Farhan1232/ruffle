@@ -108,6 +108,93 @@ pub struct RenderMemoryUsage {
     pub texture_bytes_created: u64,
     pub textures_dropped: u64,
     pub texture_bytes_dropped: u64,
+    /// Objects the graphics backend itself is holding, as it counts them.
+    ///
+    /// Ruffle's own figures say what it asked for; these say what is still
+    /// alive underneath, which is the only way to tell a resource Ruffle has
+    /// dropped from one the backend has actually released. A backend that
+    /// cannot report a figure leaves it zero.
+    pub hal: HalResourceUsage,
+    /// What the backend's memory allocator has taken from the driver, when it
+    /// can say. `reserved` counts whole blocks including their unused parts,
+    /// so `reserved - allocated` is memory the allocator owns and is not
+    /// using.
+    pub allocator: Option<AllocatorUsage>,
+    /// What a frame costs in work rather than in memory.
+    pub work: RenderWorkUsage,
+}
+
+/// Live graphics-backend objects, as the backend counts them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HalResourceUsage {
+    pub textures: usize,
+    pub texture_views: usize,
+    pub buffers: usize,
+    pub bind_groups: usize,
+    pub bind_group_layouts: usize,
+    pub render_pipelines: usize,
+    pub compute_pipelines: usize,
+    pub pipeline_layouts: usize,
+    pub samplers: usize,
+    pub command_encoders: usize,
+    pub shader_modules: usize,
+    pub query_sets: usize,
+    pub fences: usize,
+    pub texture_memory: usize,
+    pub buffer_memory: usize,
+    /// Separate allocations the backend has made from the driver.
+    pub memory_allocations: usize,
+}
+
+/// The graphics allocator's own account of what it holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AllocatorUsage {
+    /// Bytes in live sub-allocations.
+    pub allocated_bytes: u64,
+    /// Bytes in the blocks those sub-allocations sit in, unused parts
+    /// included.
+    pub reserved_bytes: u64,
+    /// How many blocks the allocator holds.
+    pub blocks: usize,
+}
+
+/// The reasons a blended group can fail to qualify for direct drawing, in the
+/// order they appear in [`RenderWorkUsage::fallbacks`]. Named here so that the
+/// report's columns exist even on a backend that never fills them.
+pub const FALLBACK_COLUMN_NAMES: &[&str] = &[
+    "multiple_draws",
+    "filtered",
+    "masked",
+    "nested_blend",
+    "complex_blend",
+    "unsupported_command",
+    "requires_intermediate",
+    "other",
+];
+
+/// What the renderer did, as opposed to what it holds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RenderWorkUsage {
+    /// Render passes encoded for the most recent frame.
+    pub render_passes: u64,
+    /// Render targets blended groups took during the most recent frame, and
+    /// their bytes; every one is held until its chunk is encoded, so the
+    /// frame's total is what was live at once.
+    pub blend_targets: usize,
+    pub blend_target_bytes: usize,
+    pub peak_blend_targets: usize,
+    pub peak_blend_target_bytes: usize,
+    /// Bind groups built, against those served from the cache kept with the
+    /// texture they describe.
+    pub bind_groups_created: u64,
+    pub bind_group_cache_hits: u64,
+    pub bind_group_cache_misses: u64,
+    /// Blended groups considered for direct drawing, and those that took it.
+    pub fastpath_eligible: u64,
+    pub fastpath_used: u64,
+    /// Why the rest did not, in the order of `fallback_names`.
+    pub fallback_names: &'static [&'static str],
+    pub fallbacks: Vec<u64>,
 }
 
 pub trait RenderBackend: Any {

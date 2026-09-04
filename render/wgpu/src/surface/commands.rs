@@ -12,7 +12,7 @@ use crate::surface::target::CommandTarget;
 use crate::{Descriptors, MaskState, Pipelines, PosUvVertex, Transforms, as_texture};
 use ruffle_render::backend::ShapeHandle;
 use ruffle_render::bitmap::{BitmapHandle, PixelRegion, PixelSnapping};
-use ruffle_render::commands::{CommandHandler, CommandList, RenderBlendMode};
+use ruffle_render::commands::{Command, CommandHandler, CommandList, RenderBlendMode};
 use ruffle_render::lines::{emulate_line, emulate_line_rect};
 use ruffle_render::matrix::Matrix;
 use ruffle_render::pixel_bender::PixelBenderShaderHandle;
@@ -659,6 +659,56 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
         result
     }
 
+    /// Draws a bitmap with an explicit blend state.
+    ///
+    /// `render_bitmap` is this with `Normal`; a blended group of one bitmap is
+    /// this with the group's blend state, which is what lets that group skip
+    /// its render target entirely.
+    fn render_bitmap_with_blend(
+        &mut self,
+        bitmap: BitmapHandle,
+        transform: Transform,
+        smoothing: bool,
+        pixel_snapping: PixelSnapping,
+        region: PixelRegion,
+        blend_mode: TrivialBlend,
+    ) {
+        let texture = as_texture(&bitmap);
+
+        let mut matrix = transform.matrix;
+        pixel_snapping.apply(&mut matrix);
+        matrix *= Matrix::scale(region.width() as f32, region.height() as f32);
+
+        let vertices: &[PosUvVertex] = {
+            let (u0, u1, v0, v1) = (
+                region.x_min as f32 / texture.texture.width() as f32,
+                region.x_max as f32 / texture.texture.width() as f32,
+                region.y_min as f32 / texture.texture.height() as f32,
+                region.y_max as f32 / texture.texture.height() as f32,
+            );
+            &[
+                PosUvVertex::new(0.0, 0.0, u0, v0, 1.0),
+                PosUvVertex::new(1.0, 0.0, u1, v0, 1.0),
+                PosUvVertex::new(1.0, 1.0, u1, v1, 1.0),
+                PosUvVertex::new(0.0, 1.0, u0, v1, 1.0),
+            ]
+        };
+
+        self.add_to_current_with_vertices(
+            matrix,
+            transform.color_transform,
+            Some(vertices),
+            |transform_buffer, vertex_offset| DrawCommand::RenderBitmap {
+                bitmap,
+                transform_buffer,
+                vertex_offset,
+                smoothing,
+                blend_mode,
+                render_stage3d: false,
+            },
+        );
+    }
+
     fn add_to_current(
         &mut self,
         matrix: Matrix,
@@ -732,6 +782,62 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
     }
 }
 
+/// Whether a blended group can be drawn straight onto its destination instead
+/// of through a render target of its own, and if not, why not.
+///
+/// The intermediate target exists so that a group composites as a unit: its
+/// children are drawn together and the blend is applied once to the result. A
+/// group of *one* drawable has nothing to composite, so for a blend mode that
+/// is just a GPU blend state, drawing that one thing with the blend state set
+/// gives the same picture without the target, the render pass, the pool take,
+/// the bind group or the second sampling step.
+///
+/// This is deliberately narrow. Anything that makes the group more than a
+/// single unconditional draw - a second command, a mask around it, a nested
+/// blend, a shape whose pipelines have no blend-state variants - keeps the
+/// target.
+fn trivial_fast_path(
+    commands: &CommandList,
+    blend_type: &BlendType,
+) -> Result<(), crate::FallbackReason> {
+    use crate::FallbackReason;
+
+    // Only the modes that are a blend state and nothing more. A complex blend
+    // reads the destination in a shader and genuinely needs the group rendered
+    // out first; a PixelBender blend is arbitrary code.
+    match blend_type {
+        BlendType::Trivial(_) => {}
+        BlendType::Complex(_) | BlendType::Shader(_) => {
+            return Err(FallbackReason::ComplexBlend);
+        }
+    }
+
+    let [command] = commands.commands.as_slice() else {
+        return Err(FallbackReason::MultipleDraws);
+    };
+
+    match command {
+        // A bitmap is the case that matters: a filtered or cached display
+        // object reaches the renderer as exactly one `render_bitmap` of its
+        // cache texture, which is what most of a crowded room's blended
+        // objects are.
+        Command::RenderBitmap { .. } => Ok(()),
+        // Shapes are drawn through the colour, gradient and bitmap-fill
+        // pipelines, which are only built with premultiplied-alpha blending;
+        // there is no `Add` or `Screen` variant of them to select.
+        Command::RenderShape { .. }
+        | Command::DrawRect { .. }
+        | Command::DrawLine { .. }
+        | Command::DrawLineRect { .. }
+        | Command::RenderStage3D { .. } => Err(FallbackReason::UnsupportedCommand),
+        Command::Blend(..) => Err(FallbackReason::NestedBlend),
+        Command::RenderAlphaMask { .. } => Err(FallbackReason::RequiresIntermediate),
+        Command::PushMask | Command::ActivateMask | Command::DeactivateMask | Command::PopMask => {
+            Err(FallbackReason::Masked)
+        }
+    }
+}
+
 impl CommandHandler for WgpuCommandHandler<'_, '_> {
     fn blend(&mut self, commands: CommandList, blend_mode: RenderBlendMode) {
         let target_layer = if let RenderBlendMode::Builtin(BlendMode::Layer) = &blend_mode {
@@ -740,6 +846,36 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
             self.nearest_layer
         };
         let blend_type = BlendType::from(blend_mode);
+
+        // A group of one drawable does not need a target of its own.
+        match trivial_fast_path(&commands, &blend_type) {
+            Ok(()) => {
+                crate::render_stats::record_fastpath(true, None);
+                let BlendType::Trivial(blend_mode) = blend_type else {
+                    unreachable!("the fast path only accepts trivial blends")
+                };
+                let Some(Command::RenderBitmap {
+                    bitmap,
+                    transform,
+                    smoothing,
+                    pixel_snapping,
+                    region,
+                }) = commands.commands.into_iter().next()
+                else {
+                    unreachable!("the fast path only accepts a single bitmap")
+                };
+                self.render_bitmap_with_blend(
+                    bitmap,
+                    transform,
+                    smoothing,
+                    pixel_snapping,
+                    region,
+                    blend_mode,
+                );
+                return;
+            }
+            Err(reason) => crate::render_stats::record_fastpath(false, Some(reason)),
+        }
 
         // Every built-in blend leaves the destination untouched where the
         // blended group is transparent - the complex-blend shaders `discard`
@@ -759,6 +895,7 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
             rect,
             wgpu::TextureFormat::Rgba8Unorm,
         );
+        crate::render_stats::blend_target_taken(rect.width as usize * rect.height as usize * 4);
         let clear_color = blend_type.default_color();
         let target = surface.draw_commands(
             RenderTargetMode::FreshWithColor(clear_color),
@@ -793,25 +930,7 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
                     perspective_projection: None,
                 };
                 let texture = target.take_color_texture();
-                let bind_group =
-                    self.descriptors
-                        .device
-                        .create_bind_group(&wgpu::BindGroupDescriptor {
-                            layout: &self.descriptors.bind_layouts.bitmap,
-                            entries: &[
-                                wgpu::BindGroupEntry {
-                                    binding: 0,
-                                    resource: wgpu::BindingResource::TextureView(texture.view()),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 1,
-                                    resource: wgpu::BindingResource::Sampler(
-                                        self.descriptors.bitmap_samplers.get_sampler(false, false),
-                                    ),
-                                },
-                            ],
-                            label: None,
-                        });
+                let bind_group = texture.bitmap_bind_group(self.descriptors).clone();
                 self.add_to_current(
                     transform.matrix,
                     transform.color_transform,
@@ -862,40 +981,14 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
         pixel_snapping: PixelSnapping,
         region: PixelRegion,
     ) {
-        let texture = as_texture(&bitmap);
-
-        let mut matrix = transform.matrix;
-        pixel_snapping.apply(&mut matrix);
-        matrix *= Matrix::scale(region.width() as f32, region.height() as f32);
-
-        let vertices: &[PosUvVertex] = {
-            let (u0, u1, v0, v1) = (
-                region.x_min as f32 / texture.texture.width() as f32,
-                region.x_max as f32 / texture.texture.width() as f32,
-                region.y_min as f32 / texture.texture.height() as f32,
-                region.y_max as f32 / texture.texture.height() as f32,
-            );
-            &[
-                PosUvVertex::new(0.0, 0.0, u0, v0, 1.0),
-                PosUvVertex::new(1.0, 0.0, u1, v0, 1.0),
-                PosUvVertex::new(1.0, 1.0, u1, v1, 1.0),
-                PosUvVertex::new(0.0, 1.0, u0, v1, 1.0),
-            ]
-        };
-
-        self.add_to_current_with_vertices(
-            matrix,
-            transform.color_transform,
-            Some(vertices),
-            |transform_buffer, vertex_offset| DrawCommand::RenderBitmap {
-                bitmap,
-                transform_buffer,
-                vertex_offset,
-                smoothing,
-                blend_mode: TrivialBlend::Normal,
-                render_stage3d: false,
-            },
-        );
+        self.render_bitmap_with_blend(
+            bitmap,
+            transform,
+            smoothing,
+            pixel_snapping,
+            region,
+            TrivialBlend::Normal,
+        )
     }
 
     fn render_stage3d(&mut self, bitmap: BitmapHandle, transform: Transform) {
@@ -1033,29 +1126,31 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
         mask.ensure_cleared(self.draw_encoder);
         let mask = mask.take_color_texture();
 
-        let binds = self
-            .descriptors
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &self.descriptors.bind_layouts.alpha_mask,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(maskee.view()),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(mask.view()),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(
-                            self.descriptors.bitmap_samplers.get_sampler(false, false),
-                        ),
-                    },
-                ],
-                label: None,
-            });
+        let descriptors = self.descriptors;
+        let binds = maskee.binds().paired(mask.binds().id(), || {
+            descriptors
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    layout: &descriptors.bind_layouts.alpha_mask,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(maskee.view()),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(mask.view()),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(
+                                descriptors.bitmap_samplers.get_sampler(false, false),
+                            ),
+                        },
+                    ],
+                    label: create_debug_label!("Alpha mask").as_deref(),
+                })
+        });
 
         self.add_to_current(matrix, Default::default(), |transform_buffer| {
             DrawCommand::RenderAlphaMask {

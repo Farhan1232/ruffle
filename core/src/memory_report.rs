@@ -129,6 +129,12 @@ pub struct MemoryReport {
     pub texture_bytes_created: u64,
     pub textures_dropped: u64,
     pub texture_bytes_dropped: u64,
+    /// What the graphics backend is still holding underneath Ruffle's own
+    /// accounting, and what its allocator has taken from the driver.
+    pub hal: ruffle_render::backend::HalResourceUsage,
+    pub allocator: Option<ruffle_render::backend::AllocatorUsage>,
+    /// What the last frame cost in render passes, targets and bind groups.
+    pub work: ruffle_render::backend::RenderWorkUsage,
 }
 
 impl MemoryReport {
@@ -159,6 +165,9 @@ impl MemoryReport {
             report.texture_kind_dropped_bytes = gpu.texture_kind_dropped_bytes;
             report.peak_texture_bytes = gpu.peak_texture_bytes;
             report.pool_reuses = gpu.pool_reuses;
+            report.hal = gpu.hal;
+            report.allocator = gpu.allocator;
+            report.work = gpu.work;
             report.pool_misses = gpu.pool_misses;
             report.main_pool_idle_textures = gpu.main_pool_idle_textures;
             report.main_pool_idle_bytes = gpu.main_pool_idle_bytes;
@@ -231,8 +240,20 @@ impl MemoryReport {
              main_pool_idle_textures,main_pool_idle_bytes,main_pool_size_classes,\
              offscreen_pool_idle_textures,offscreen_pool_idle_bytes,offscreen_pool_size_classes,\
              buffer_pool_idle_entries,buffer_pool_idle_bytes,\
-             textures_created,texture_bytes_created,textures_dropped,texture_bytes_dropped",
+             textures_created,texture_bytes_created,textures_dropped,texture_bytes_dropped,\
+             hal_textures,hal_texture_views,hal_buffers,hal_bind_groups,hal_bind_group_layouts,\
+             hal_render_pipelines,hal_compute_pipelines,hal_pipeline_layouts,hal_samplers,\
+             hal_command_encoders,hal_shader_modules,hal_query_sets,hal_fences,\
+             hal_texture_memory,hal_buffer_memory,hal_memory_allocations,\
+             allocator_allocated_bytes,allocator_reserved_bytes,allocator_blocks,\
+             render_passes,blend_targets_live,blend_target_bytes,\
+             peak_blend_targets,peak_blend_target_bytes,\
+             bind_groups_created,bind_group_cache_hits,bind_group_cache_misses,\
+             trivial_blend_fastpath_eligible,trivial_blend_fastpath_used",
         );
+        for name in ruffle_render::backend::FALLBACK_COLUMN_NAMES {
+            let _ = write!(header, ",fastpath_fallback_{name}");
+        }
         for kind in kinds {
             for suffix in [
                 "live",
@@ -291,6 +312,43 @@ impl MemoryReport {
             self.textures_dropped,
             self.texture_bytes_dropped,
         );
+        let allocator = self.allocator.unwrap_or_default();
+        let _ = write!(
+            row,
+            ",{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            self.hal.textures,
+            self.hal.texture_views,
+            self.hal.buffers,
+            self.hal.bind_groups,
+            self.hal.bind_group_layouts,
+            self.hal.render_pipelines,
+            self.hal.compute_pipelines,
+            self.hal.pipeline_layouts,
+            self.hal.samplers,
+            self.hal.command_encoders,
+            self.hal.shader_modules,
+            self.hal.query_sets,
+            self.hal.fences,
+            self.hal.texture_memory,
+            self.hal.buffer_memory,
+            self.hal.memory_allocations,
+            allocator.allocated_bytes,
+            allocator.reserved_bytes,
+            allocator.blocks,
+            self.work.render_passes,
+            self.work.blend_targets,
+            self.work.blend_target_bytes,
+            self.work.peak_blend_targets,
+            self.work.peak_blend_target_bytes,
+            self.work.bind_groups_created,
+            self.work.bind_group_cache_hits,
+            self.work.bind_group_cache_misses,
+            self.work.fastpath_eligible,
+            self.work.fastpath_used,
+        );
+        for i in 0..ruffle_render::backend::FALLBACK_COLUMN_NAMES.len() {
+            let _ = write!(row, ",{}", self.work.fallbacks.get(i).copied().unwrap_or(0));
+        }
         for i in 0..self.texture_kind_names.len() {
             let at = |v: &Vec<usize>| v.get(i).copied().unwrap_or(0);
             let at64 = |v: &Vec<u64>| v.get(i).copied().unwrap_or(0);

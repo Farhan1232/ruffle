@@ -196,12 +196,18 @@ pub struct PooledTexture(
     pub wgpu::Texture,
     pub wgpu::TextureView,
     pub(crate) crate::TextureKind,
+    pub(crate) crate::bind_cache::BindGroupCache,
 );
 
 impl PooledTexture {
     fn new(texture: wgpu::Texture, view: wgpu::TextureView, kind: crate::TextureKind) -> Self {
         crate::track_texture_created(&texture, kind);
-        Self(texture, view, kind)
+        Self(
+            texture,
+            view,
+            kind,
+            crate::bind_cache::BindGroupCache::default(),
+        )
     }
 }
 

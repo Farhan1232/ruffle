@@ -16,10 +16,11 @@ use crate::{
 };
 use image::imageops::FilterType;
 use ruffle_render::backend::{
-    BitmapCacheEntry, Context3D, Context3DProfile, PixelBenderOutput, PixelBenderTarget,
+    AllocatorUsage, HalResourceUsage, PoolKeyReport, RenderBackend, RenderMemoryUsage,
+    RenderWorkUsage, ShapeHandle, ViewportDimensions,
 };
 use ruffle_render::backend::{
-    PoolKeyReport, RenderBackend, RenderMemoryUsage, ShapeHandle, ViewportDimensions,
+    BitmapCacheEntry, Context3D, Context3DProfile, PixelBenderOutput, PixelBenderTarget,
 };
 use ruffle_render::bitmap::{
     Bitmap, BitmapFormat, BitmapHandle, BitmapSource, PixelRegion, RgbaBufRead, SyncHandle,
@@ -564,6 +565,50 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             texture_bytes_created: stats.created_bytes.iter().sum(),
             textures_dropped: stats.dropped_count.iter().sum(),
             texture_bytes_dropped: stats.dropped_bytes.iter().sum(),
+            hal: HalResourceUsage {
+                textures: read(counters.textures.read()),
+                texture_views: read(counters.texture_views.read()),
+                buffers: read(counters.buffers.read()),
+                bind_groups: read(counters.bind_groups.read()),
+                bind_group_layouts: read(counters.bind_group_layouts.read()),
+                render_pipelines: read(counters.render_pipelines.read()),
+                compute_pipelines: read(counters.compute_pipelines.read()),
+                pipeline_layouts: read(counters.pipeline_layouts.read()),
+                samplers: read(counters.samplers.read()),
+                command_encoders: read(counters.command_encoders.read()),
+                shader_modules: read(counters.shader_modules.read()),
+                query_sets: read(counters.query_sets.read()),
+                fences: read(counters.fences.read()),
+                texture_memory: read(counters.texture_memory.read()),
+                buffer_memory: read(counters.buffer_memory.read()),
+                memory_allocations: read(counters.memory_allocations.read()),
+            },
+            allocator: self
+                .descriptors
+                .device
+                .generate_allocator_report()
+                .map(|report| AllocatorUsage {
+                    allocated_bytes: report.total_allocated_bytes,
+                    reserved_bytes: report.total_reserved_bytes,
+                    blocks: report.blocks.len(),
+                }),
+            work: {
+                let work = crate::render_stats();
+                RenderWorkUsage {
+                    render_passes: work.render_passes_last_frame,
+                    blend_targets: work.blend_targets_live,
+                    blend_target_bytes: work.blend_target_bytes,
+                    peak_blend_targets: work.peak_blend_targets,
+                    peak_blend_target_bytes: work.peak_blend_target_bytes,
+                    bind_groups_created: work.bind_groups_created,
+                    bind_group_cache_hits: work.bind_group_cache_hits,
+                    bind_group_cache_misses: work.bind_group_cache_misses,
+                    fastpath_eligible: work.fastpath_eligible,
+                    fastpath_used: work.fastpath_used,
+                    fallback_names: crate::render_stats::FALLBACK_NAMES,
+                    fallbacks: work.fallbacks,
+                }
+            },
         })
     }
 
@@ -769,6 +814,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
 
         self.active_frame
             .submit_for_target(&self.descriptors, &self.target, frame_output);
+        crate::render_stats::end_frame();
 
         // Both pools live for the whole session, so they grow to the busiest
         // frame they have ever drawn and stay there. Give them the chance to

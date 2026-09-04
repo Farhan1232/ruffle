@@ -29,6 +29,7 @@ type Error = Box<dyn std::error::Error>;
 #[macro_use]
 pub mod utils;
 
+mod bind_cache;
 mod bitmaps;
 mod bounds;
 mod context3d;
@@ -412,6 +413,158 @@ mod texture_stats {
 
 pub(crate) use texture_stats::{KIND_NAMES, TextureKind};
 pub use texture_stats::{TextureStats, texture_stats};
+
+/// What a frame costs the renderer in work rather than in memory.
+///
+/// The blend-target sizing fix removed the bandwidth half of a crowded room's
+/// cost; what is left is a fixed price per target - a render pass, a bind
+/// group, a pool take and return - which is proportional to how *many* targets
+/// a frame wants, not how big they are. These counters are what let that price
+/// be measured and attributed.
+pub mod render_stats {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    static RENDER_PASSES: AtomicU64 = AtomicU64::new(0);
+    static BIND_GROUPS_CREATED: AtomicU64 = AtomicU64::new(0);
+    static BIND_GROUP_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+    static BIND_GROUP_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+    static BLEND_TARGETS_LIVE: AtomicUsize = AtomicUsize::new(0);
+    static BLEND_TARGET_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static PEAK_BLEND_TARGETS: AtomicUsize = AtomicUsize::new(0);
+    static PEAK_BLEND_TARGET_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static FASTPATH_ELIGIBLE: AtomicU64 = AtomicU64::new(0);
+    static FASTPATH_USED: AtomicU64 = AtomicU64::new(0);
+
+    /// Why a blend could not take the direct path. Kept as counters rather
+    /// than log lines: a crowded frame asks the question hundreds of times.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum FallbackReason {
+        MultipleDraws,
+        Filtered,
+        Masked,
+        NestedBlend,
+        ComplexBlend,
+        UnsupportedCommand,
+        RequiresIntermediate,
+        Other,
+    }
+
+    pub const FALLBACK_NAMES: &[&str] = &[
+        "multiple_draws",
+        "filtered",
+        "masked",
+        "nested_blend",
+        "complex_blend",
+        "unsupported_command",
+        "requires_intermediate",
+        "other",
+    ];
+
+    static FALLBACKS: [AtomicU64; 8] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+
+    pub(crate) fn record_render_pass() {
+        RENDER_PASSES.fetch_add(1, Ordering::Relaxed);
+        FRAME_RENDER_PASSES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_bind_group_created() {
+        BIND_GROUPS_CREATED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_bind_group_cache(hit: bool) {
+        if hit {
+            BIND_GROUP_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            BIND_GROUP_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    static FRAME_BLEND_TARGETS: AtomicUsize = AtomicUsize::new(0);
+    static FRAME_BLEND_TARGET_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static FRAME_RENDER_PASSES: AtomicU64 = AtomicU64::new(0);
+    static LAST_FRAME_RENDER_PASSES: AtomicU64 = AtomicU64::new(0);
+
+    /// A blend has taken a render target of `bytes`.
+    ///
+    /// Counted per frame rather than as a live gauge: every target a frame
+    /// takes is held until the chunk that composites it is encoded, so the
+    /// frame's total *is* what was live at once.
+    pub(crate) fn blend_target_taken(bytes: usize) {
+        FRAME_BLEND_TARGETS.fetch_add(1, Ordering::Relaxed);
+        FRAME_BLEND_TARGET_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Closes a frame: this frame's counts become the reported ones.
+    pub(crate) fn end_frame() {
+        let targets = FRAME_BLEND_TARGETS.swap(0, Ordering::Relaxed);
+        let bytes = FRAME_BLEND_TARGET_BYTES.swap(0, Ordering::Relaxed);
+        let passes = FRAME_RENDER_PASSES.swap(0, Ordering::Relaxed);
+        BLEND_TARGETS_LIVE.store(targets, Ordering::Relaxed);
+        BLEND_TARGET_BYTES.store(bytes, Ordering::Relaxed);
+        LAST_FRAME_RENDER_PASSES.store(passes, Ordering::Relaxed);
+        PEAK_BLEND_TARGETS.fetch_max(targets, Ordering::Relaxed);
+        PEAK_BLEND_TARGET_BYTES.fetch_max(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_fastpath(used: bool, reason: Option<FallbackReason>) {
+        FASTPATH_ELIGIBLE.fetch_add(1, Ordering::Relaxed);
+        if used {
+            FASTPATH_USED.fetch_add(1, Ordering::Relaxed);
+        } else if let Some(reason) = reason {
+            FALLBACKS[reason as usize].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// What the renderer has done so far. Differences between two readings
+    /// give the cost of the span between them.
+    #[derive(Clone, Debug, Default)]
+    pub struct RenderStats {
+        pub render_passes: u64,
+        pub bind_groups_created: u64,
+        pub bind_group_cache_hits: u64,
+        pub bind_group_cache_misses: u64,
+        pub blend_targets_live: usize,
+        pub blend_target_bytes: usize,
+        pub peak_blend_targets: usize,
+        pub peak_blend_target_bytes: usize,
+        pub fastpath_eligible: u64,
+        pub fastpath_used: u64,
+        pub fallbacks: Vec<u64>,
+        /// Render passes encoded for the most recent frame.
+        pub render_passes_last_frame: u64,
+    }
+
+    pub fn render_stats() -> RenderStats {
+        RenderStats {
+            render_passes: RENDER_PASSES.load(Ordering::Relaxed),
+            bind_groups_created: BIND_GROUPS_CREATED.load(Ordering::Relaxed),
+            bind_group_cache_hits: BIND_GROUP_CACHE_HITS.load(Ordering::Relaxed),
+            bind_group_cache_misses: BIND_GROUP_CACHE_MISSES.load(Ordering::Relaxed),
+            blend_targets_live: BLEND_TARGETS_LIVE.load(Ordering::Relaxed),
+            blend_target_bytes: BLEND_TARGET_BYTES.load(Ordering::Relaxed),
+            peak_blend_targets: PEAK_BLEND_TARGETS.load(Ordering::Relaxed),
+            peak_blend_target_bytes: PEAK_BLEND_TARGET_BYTES.load(Ordering::Relaxed),
+            fastpath_eligible: FASTPATH_ELIGIBLE.load(Ordering::Relaxed),
+            fastpath_used: FASTPATH_USED.load(Ordering::Relaxed),
+            fallbacks: FALLBACKS
+                .iter()
+                .map(|c| c.load(Ordering::Relaxed))
+                .collect(),
+            render_passes_last_frame: LAST_FRAME_RENDER_PASSES.load(Ordering::Relaxed),
+        }
+    }
+}
+
+pub use render_stats::{FallbackReason, RenderStats, render_stats};
 
 pub(crate) fn texture_stats_record_pool_reuse() {
     texture_stats::record_pool_reuse();

@@ -26,6 +26,7 @@ use ruffle_render_wgpu::buffer_pool::{PoolUsage, pool_usage};
 use ruffle_render_wgpu::descriptors::Descriptors;
 use ruffle_render_wgpu::target::TextureTarget;
 use ruffle_render_wgpu::wgpu;
+use ruffle_render_wgpu::{RenderStats, render_stats};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -50,7 +51,7 @@ fn crowds() -> Vec<usize> {
             .split(',')
             .map(|n| n.trim().parse().expect("crowd sizes are numbers"))
             .collect(),
-        Err(_) => vec![50, 100, 250, 500, 700],
+        Err(_) => vec![50, 100, 250, 500, 800],
     }
 }
 
@@ -102,6 +103,8 @@ fn crowd(bitmap: &BitmapHandle, count: usize, blend_mode: BlendMode) -> CommandL
 
 struct Measurement {
     usage: PoolUsage,
+    work: RenderStats,
+    frames: usize,
     /// Time to walk the commands and encode the frame, without waiting for the
     /// GPU. This is what a stuttering frame costs the main thread.
     cpu_times: Vec<Duration>,
@@ -150,6 +153,7 @@ fn measure(
     }
 
     let before = pool_usage();
+    let work_before = render_stats();
     let mut cpu_times = Vec::with_capacity(MEASURED_FRAMES);
     let mut frame_times = Vec::with_capacity(MEASURED_FRAMES);
     for _ in 0..MEASURED_FRAMES {
@@ -162,8 +166,26 @@ fn measure(
         frame_times.push(start.elapsed());
     }
 
+    let after = render_stats();
     Measurement {
         usage: pool_usage() - before,
+        work: RenderStats {
+            render_passes: after.render_passes - work_before.render_passes,
+            bind_groups_created: after.bind_groups_created - work_before.bind_groups_created,
+            bind_group_cache_hits: after.bind_group_cache_hits - work_before.bind_group_cache_hits,
+            bind_group_cache_misses: after.bind_group_cache_misses
+                - work_before.bind_group_cache_misses,
+            fastpath_eligible: after.fastpath_eligible - work_before.fastpath_eligible,
+            fastpath_used: after.fastpath_used - work_before.fastpath_used,
+            fallbacks: after
+                .fallbacks
+                .iter()
+                .zip(&work_before.fallbacks)
+                .map(|(a, b)| a - b)
+                .collect(),
+            ..after
+        },
+        frames: MEASURED_FRAMES,
         cpu_times,
         frame_times,
     }
@@ -204,28 +226,44 @@ fn a_crowded_room_does_not_ask_for_screen_sized_targets() {
             OBJECT.0, OBJECT.1, VIEWPORT.0, VIEWPORT.1
         );
         println!(
-            "{:>7}  {:>14}  {:>12}  {:>9}  {:>7}  {:>8}  {:>8}  {:>8}",
+            "{:>7} {:>10} {:>9} {:>8} {:>8} {:>8} {:>7} {:>7} {:>7} {:>7} {:>7}",
             "objects",
-            "target px/frame",
-            "target MB/fr",
-            "builds/fr",
-            "reuse",
+            "target MB",
+            "passes/fr",
+            "targets",
+            "bg made",
+            "bg hit%",
+            "fast%",
             "cpu ms",
             "mean ms",
-            "p95 ms"
+            "p95 ms",
+            "p99 ms"
         );
         for count in crowds() {
             let m = measure(&mut backend, &bitmap, count, blend_mode);
+            let frames = m.frames as f64;
+            let bg_total = m.work.bind_group_cache_hits + m.work.bind_group_cache_misses;
             println!(
-                "{:>7}  {:>14}  {:>12.1}  {:>9.1}  {:>6.1}%  {:>8.1}  {:>8.1}  {:>8.1}",
+                "{:>7} {:>10.1} {:>9.1} {:>8.1} {:>8.1} {:>7.1}% {:>6.0}% {:>7.1} {:>7.1} {:>7.1} {:>7.1}",
                 count,
-                m.per_frame_pixels(),
                 m.per_frame_pixels() as f64 * 4.0 / (1024.0 * 1024.0),
-                m.per_frame_builds(),
-                m.reuse_rate() * 100.0,
+                m.work.render_passes as f64 / frames,
+                m.work.blend_targets_live as f64,
+                m.work.bind_groups_created as f64 / frames,
+                if bg_total > 0 {
+                    100.0 * m.work.bind_group_cache_hits as f64 / bg_total as f64
+                } else {
+                    0.0
+                },
+                if m.work.fastpath_eligible > 0 {
+                    100.0 * m.work.fastpath_used as f64 / m.work.fastpath_eligible as f64
+                } else {
+                    0.0
+                },
                 Measurement::mean_ms(&m.cpu_times),
                 Measurement::mean_ms(&m.frame_times),
                 Measurement::percentile_ms(&m.frame_times, 0.95),
+                Measurement::percentile_ms(&m.frame_times, 0.99),
             );
 
             // The point of the exercise: an object a fraction of the screen's
