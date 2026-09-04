@@ -1,5 +1,6 @@
 use crate::Transforms;
 use crate::backend::RenderTargetMode;
+use crate::bounds::TargetRect;
 use crate::buffer_pool::{AlwaysCompatible, PoolEntry, PooledTexture, TexturePool};
 use crate::descriptors::Descriptors;
 use crate::globals::Globals;
@@ -58,7 +59,6 @@ impl ResolveBuffer {
 #[derive(Debug)]
 pub struct FrameBuffer {
     texture: PoolOrArcTexture,
-    size: wgpu::Extent3d,
 }
 
 #[derive(Debug)]
@@ -99,17 +99,15 @@ impl FrameBuffer {
 
         Self {
             texture: PoolOrArcTexture::Pool(texture),
-            size,
         }
     }
 
-    pub fn new_manual(texture: wgpu::Texture, size: wgpu::Extent3d) -> Self {
+    pub fn new_manual(texture: wgpu::Texture) -> Self {
         Self {
             texture: PoolOrArcTexture::Manual((
                 texture.clone(),
                 texture.create_view(&Default::default()),
             )),
-            size,
         }
     }
 
@@ -129,10 +127,6 @@ impl FrameBuffer {
 
     pub fn take_texture(self) -> PoolOrArcTexture {
         self.texture
-    }
-
-    pub fn size(&self) -> wgpu::Extent3d {
-        self.size
     }
 }
 
@@ -197,6 +191,12 @@ pub struct CommandTarget {
     resolve_buffer: Option<ResolveBuffer>,
     depth: OnceCell<StencilBuffer>,
     globals: Arc<Globals>,
+    /// Where this target sits in the coordinates of the commands drawn into it.
+    ///
+    /// A blend composited onto this target needs it to know its own position:
+    /// the blend samples this target's pixels through the rectangle it covers,
+    /// and the two rectangles are given in the same space.
+    rect: TargetRect,
     size: wgpu::Extent3d,
     format: wgpu::TextureFormat,
     sample_count: u32,
@@ -209,12 +209,13 @@ impl CommandTarget {
     pub fn new(
         descriptors: &Descriptors,
         pool: &mut TexturePool,
-        size: wgpu::Extent3d,
+        rect: TargetRect,
         format: wgpu::TextureFormat,
         sample_count: u32,
         render_target_mode: RenderTargetMode,
         encoder: &mut wgpu::CommandEncoder,
     ) -> Self {
+        let size = rect.extent();
         let globals = pool.get_globals(descriptors, size.width, size.height);
 
         let mut make_pooled_frame_buffer = || {
@@ -245,10 +246,7 @@ impl CommandTarget {
                         Some(ResolveBuffer::new_manual(texture.clone())),
                     )
                 } else {
-                    (
-                        FrameBuffer::new_manual(texture.clone(), texture.size()),
-                        None,
-                    )
+                    (FrameBuffer::new_manual(texture.clone()), None)
                 }
             } else if sample_count > 1 {
                 (
@@ -307,6 +305,7 @@ impl CommandTarget {
             resolve_buffer,
             depth: OnceCell::new(),
             globals,
+            rect,
             size,
             format,
             sample_count,
@@ -314,6 +313,10 @@ impl CommandTarget {
             color_needs_clear: OnceCell::new(),
             render_target_mode,
         }
+    }
+
+    pub fn rect(&self) -> TargetRect {
+        self.rect
     }
 
     pub fn width(&self) -> u32 {
@@ -398,11 +401,21 @@ impl CommandTarget {
         })
     }
 
+    /// Takes a copy of this target's pixels for a blend to read as its
+    /// destination, refreshing `region` of it.
+    ///
+    /// `region` is in this target's own pixels. A blend only samples the
+    /// destination underneath the rectangle it covers, so only that part has to
+    /// be up to date - and copying the whole screen for each of a crowded
+    /// scene's hundreds of blends is most of what made them expensive. The rest
+    /// of the buffer holds whatever an earlier blend left there and is never
+    /// read.
     pub fn update_blend_buffer(
         &self,
         descriptors: &Descriptors,
         pool: &mut TexturePool,
         encoder: &mut wgpu::CommandEncoder,
+        region: TargetRect,
     ) -> &BlendBuffer {
         let blend_buffer = self.blend_buffer.get_or_init(|| {
             BlendBuffer::new(
@@ -416,6 +429,17 @@ impl CommandTarget {
             )
         });
         self.ensure_cleared(encoder);
+
+        // Clamp to the target: `region` comes from a blend's own bounds, which
+        // are rounded out and may be a pixel past the edge.
+        let x = region.x.clamp(0, self.size.width as i32) as u32;
+        let y = region.y.clamp(0, self.size.height as i32) as u32;
+        let width = (region.right().clamp(0, self.size.width as i32) as u32).saturating_sub(x);
+        let height = (region.bottom().clamp(0, self.size.height as i32) as u32).saturating_sub(y);
+        if width == 0 || height == 0 {
+            return blend_buffer;
+        }
+
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: self
@@ -424,16 +448,20 @@ impl CommandTarget {
                     .map(|b| b.texture())
                     .unwrap_or_else(|| self.frame_buffer.texture()),
                 mip_level: 0,
-                origin: Default::default(),
+                origin: wgpu::Origin3d { x, y, z: 0 },
                 aspect: Default::default(),
             },
             wgpu::TexelCopyTextureInfo {
                 texture: blend_buffer.texture(),
                 mip_level: 0,
-                origin: Default::default(),
+                origin: wgpu::Origin3d { x, y, z: 0 },
                 aspect: Default::default(),
             },
-            self.frame_buffer.size(),
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
         );
         blend_buffer
     }

@@ -2,7 +2,13 @@
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
-    @location(0) uv: vec2<f32>,
+    /// Where this corner lands in the destination being blended onto, which is
+    /// not always the target being drawn into: an Alpha or Erase reads the
+    /// nearest layer above it.
+    @location(0) parent_uv: vec2<f32>,
+    /// Where this corner is in the blended group's own target. The quad covers
+    /// that target exactly, so this is just the quad's own coordinates.
+    @location(1) current_uv: vec2<f32>,
 };
 
 @group(1) @binding(0) var<uniform> transforms: common__Transforms;
@@ -11,10 +17,9 @@ struct VertexOutput {
 @group(2) @binding(2) var texture_sampler: sampler;
 
 @vertex
-fn main_vertex(in: common__VertexInput) -> VertexOutput {
+fn main_vertex(in: common__VertexInputUv) -> VertexOutput {
     let pos = common__globals.view_matrix * transforms.world_matrix * vec4<f32>(in.position.x, in.position.y, 1.0, 1.0);
-    let uv = vec2<f32>((pos.x + 1.0) / 2.0, -((pos.y - 1.0) / 2.0));
-    return VertexOutput(pos, uv);
+    return VertexOutput(pos, in.uv.xy / in.uv.z, in.position);
 }
 
 fn blend_func(src: vec3<f32>, dst: vec3<f32>) -> vec3<f32> {
@@ -24,9 +29,9 @@ fn blend_func(src: vec3<f32>, dst: vec3<f32>) -> vec3<f32> {
 @fragment
 fn main_fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // dst is the parent pixel we're blending onto
-    var dst: vec4<f32> = textureSample(parent_texture, texture_sampler, in.uv);
+    var dst: vec4<f32> = textureSample(parent_texture, texture_sampler, in.parent_uv);
     // src is the pixel that we want to apply
-    var src: vec4<f32> = textureSample(current_texture, texture_sampler, in.uv);
+    var src: vec4<f32> = textureSample(current_texture, texture_sampler, in.current_uv);
 
     // Flash does the following, which makes this not a pure multiply:
     // If src.a is 0, don't write anything

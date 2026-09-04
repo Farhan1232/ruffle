@@ -6,6 +6,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use wgpu::util::DeviceExt;
 
+use crate::bounds::PixelRect;
 use crate::buffer_builder::BufferBuilder;
 use ruffle_render::backend::{ShapeHandle, ShapeHandleImpl};
 use ruffle_render::bitmap::BitmapSource;
@@ -20,6 +21,13 @@ pub struct Mesh {
     pub draws: Vec<Draw>,
     pub vertex_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
+    /// The extent of the tessellated geometry, in the shape's own pixels.
+    ///
+    /// Taken from the vertices themselves rather than from the SWF's declared
+    /// shape bounds, so it covers exactly what is rasterised - stroke joins and
+    /// caps included - and nothing else. [`crate::bounds`] uses it to size the
+    /// temporary targets a blended shape is drawn through.
+    pub bounds: PixelRect,
 }
 
 /// Bytes of vertex and index buffers held by live meshes, and how many
@@ -30,7 +38,12 @@ static MESH_BYTES: AtomicUsize = AtomicUsize::new(0);
 static MESH_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 impl Mesh {
-    pub fn new(draws: Vec<Draw>, vertex_buffer: wgpu::Buffer, index_buffer: wgpu::Buffer) -> Self {
+    pub fn new(
+        draws: Vec<Draw>,
+        vertex_buffer: wgpu::Buffer,
+        index_buffer: wgpu::Buffer,
+        bounds: PixelRect,
+    ) -> Self {
         MESH_BYTES.fetch_add(
             (vertex_buffer.size() + index_buffer.size()) as usize,
             Ordering::Relaxed,
@@ -40,6 +53,7 @@ impl Mesh {
             draws,
             vertex_buffer,
             index_buffer,
+            bounds,
         }
     }
 
@@ -75,6 +89,8 @@ pub struct PendingDraw {
     pub indices: Range<wgpu::BufferAddress>,
     pub num_indices: u32,
     pub num_mask_indices: u32,
+    /// The extent of this draw's vertices, in the shape's own pixels.
+    pub bounds: PixelRect,
 }
 
 impl PendingDraw {
@@ -115,6 +131,14 @@ impl PendingDraw {
         vertex_buffer: &mut BufferBuilder,
         index_buffer: &mut BufferBuilder,
     ) -> Option<Self> {
+        let mut bounds = PixelRect::EMPTY;
+        for vertex in &draw.vertices {
+            bounds.x_min = bounds.x_min.min(vertex.x);
+            bounds.y_min = bounds.y_min.min(vertex.y);
+            bounds.x_max = bounds.x_max.max(vertex.x);
+            bounds.y_max = bounds.y_max.max(vertex.y);
+        }
+
         let vertices = match &draw.draw_type {
             TessDrawType::Color => {
                 let vertices: Vec<_> = draw
@@ -167,6 +191,7 @@ impl PendingDraw {
             indices,
             num_indices: index_count,
             num_mask_indices: draw.mask_index_count,
+            bounds,
         })
     }
 }

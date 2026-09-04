@@ -1,3 +1,4 @@
+use crate::bounds::PixelRect;
 use crate::buffer_builder::BufferBuilder;
 use crate::buffer_pool::{BufferPool, TexturePool};
 use crate::context3d::WgpuContext3D;
@@ -356,12 +357,16 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             wgpu::BufferUsages::INDEX,
         );
 
+        let bounds = draws
+            .iter()
+            .fold(PixelRect::EMPTY, |bounds, draw| bounds.union(draw.bounds));
+
         let draws = draws
             .into_iter()
             .map(|d| d.finish(&self.descriptors, &uniform_buffer, &gradients))
             .collect();
 
-        Mesh::new(draws, vertex_buffer, index_buffer)
+        Mesh::new(draws, vertex_buffer, index_buffer, bounds)
     }
 
     fn clamp_bitmap(&self, bitmap: &mut Bitmap) -> bool {

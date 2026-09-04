@@ -3,7 +3,52 @@ use crate::globals::Globals;
 use fnv::FnvHashMap;
 use std::fmt::{Debug, Formatter};
 use std::ops::Deref;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+
+/// What the render-target pool has been asked for since the process started.
+///
+/// The pixels are the headline number: a frame's temporary targets are
+/// allocated, cleared, drawn into, sampled and composited, so what they cost in
+/// bandwidth is proportional to how many pixels of them a frame asks for. The
+/// builds are the other half - a target that has to be created is a driver
+/// allocation, which the pool exists to avoid.
+static POOL_TAKES: AtomicU64 = AtomicU64::new(0);
+static POOL_BUILDS: AtomicU64 = AtomicU64::new(0);
+static POOL_PIXELS: AtomicU64 = AtomicU64::new(0);
+
+/// Counts of what the render-target pool has handed out.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct PoolUsage {
+    /// Targets handed out, whether re-used or freshly built.
+    pub takes: u64,
+    /// Targets that had to be built because no idle one was available.
+    pub builds: u64,
+    /// Pixels of all the targets handed out.
+    pub pixels: u64,
+}
+
+impl std::ops::Sub for PoolUsage {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self {
+        Self {
+            takes: self.takes - rhs.takes,
+            builds: self.builds - rhs.builds,
+            pixels: self.pixels - rhs.pixels,
+        }
+    }
+}
+
+/// What the render-target pool has handed out so far. Subtract two readings to
+/// measure a stretch of rendering.
+pub fn pool_usage() -> PoolUsage {
+    PoolUsage {
+        takes: POOL_TAKES.load(Ordering::Relaxed),
+        builds: POOL_BUILDS.load(Ordering::Relaxed),
+        pixels: POOL_PIXELS.load(Ordering::Relaxed),
+    }
+}
 
 type PoolInner<T> = Mutex<PoolState<T>>;
 
@@ -178,6 +223,11 @@ impl TexturePool {
                 PooledTexture::new(texture, view)
             }))
         });
+        POOL_TAKES.fetch_add(1, Ordering::Relaxed);
+        POOL_PIXELS.fetch_add(
+            u64::from(size.width) * u64::from(size.height),
+            Ordering::Relaxed,
+        );
         pool.take(descriptors, AlwaysCompatible)
     }
 
@@ -300,6 +350,7 @@ impl<Type, Description: BufferDescription> BufferPool<Type, Description> {
         let (item, used_description) = if let Some((_, best)) = best {
             guard.available.swap_remove(best)
         } else {
+            POOL_BUILDS.fetch_add(1, Ordering::Relaxed);
             let item = (self.constructor)(descriptors, &description);
             (item, description)
         };

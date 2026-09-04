@@ -2,6 +2,7 @@ use super::target::PoolOrArcTexture;
 use crate::backend::RenderTargetMode;
 use crate::blend::TrivialBlend;
 use crate::blend::{BlendType, ComplexBlend};
+use crate::bounds::{TargetRect, content_bounds, target_rect_for};
 use crate::buffer_builder::BufferBuilder;
 use crate::buffer_pool::TexturePool;
 use crate::dynamic_transforms::DynamicTransforms;
@@ -421,6 +422,9 @@ pub enum Chunk {
         texture: PoolOrArcTexture,
         blend_mode: ChunkBlendMode,
         needs_stencil: bool,
+        /// Where the blended group's target belongs, in the coordinates the
+        /// commands of the target it is composited into are expressed in.
+        rect: TargetRect,
     },
 }
 
@@ -489,6 +493,21 @@ impl DrawCommand {
     }
 }
 
+/// The matrix that maps the unit square onto `rect`.
+///
+/// Compositing a sub-target back is a quad of exactly that shape, so this puts
+/// its texture where its contents were.
+pub fn rect_matrix(rect: TargetRect) -> Matrix {
+    Matrix {
+        a: rect.width as f32,
+        b: 0.0,
+        c: 0.0,
+        d: rect.height as f32,
+        tx: Twips::from_pixels(rect.x as f64),
+        ty: Twips::from_pixels(rect.y as f64),
+    }
+}
+
 #[derive(Copy, Clone)]
 pub enum LayerRef<'a> {
     None,
@@ -507,8 +526,7 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
     draw_encoder: &'encoder mut Scope<'global, wgpu::CommandEncoder>,
     meshes: &'encoder Vec<Mesh>,
     quality: StageQuality,
-    width: u32,
-    height: u32,
+    rect: TargetRect,
     nearest_layer: LayerRef,
     texture_pool: &'encoder mut TexturePool,
 ) -> Vec<Chunk> {
@@ -519,8 +537,7 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
         draw_encoder,
         meshes,
         quality,
-        width,
-        height,
+        rect,
         nearest_layer,
         texture_pool,
     )
@@ -530,8 +547,13 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
 struct WgpuCommandHandler<'encoder, 'global: 'encoder> {
     descriptors: &'encoder Descriptors,
     quality: StageQuality,
-    width: u32,
-    height: u32,
+    /// The target these commands are being drawn into, in the space the
+    /// commands themselves are expressed in.
+    ///
+    /// Commands always carry the coordinates they would have on the surface
+    /// that started this draw, so a target that covers only part of it has to
+    /// take its own origin back off every matrix it hands to the shaders.
+    rect: TargetRect,
     nearest_layer: LayerRef<'encoder>,
     meshes: &'encoder Vec<Mesh>,
     staging_belt: &'encoder mut wgpu::util::StagingBelt,
@@ -557,8 +579,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
         draw_encoder: &'encoder mut Scope<'global, wgpu::CommandEncoder>,
         meshes: &'encoder Vec<Mesh>,
         quality: StageQuality,
-        width: u32,
-        height: u32,
+        rect: TargetRect,
         nearest_layer: LayerRef<'encoder>,
         texture_pool: &'encoder mut TexturePool,
     ) -> Self {
@@ -573,8 +594,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
         Self {
             descriptors,
             quality,
-            width,
-            height,
+            rect,
             nearest_layer,
             meshes,
             staging_belt,
@@ -657,14 +677,16 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
         vertices: Option<&[PosUvVertex]>,
         command_builder: impl FnOnce(wgpu::DynamicOffset, Option<wgpu::BufferAddress>) -> DrawCommand,
     ) {
+        // Commands are in the coordinates of the surface that started this
+        // draw; this target may cover only part of it.
         let transform = Transforms {
             world_matrix: [
                 [matrix.a, matrix.b, 0.0, 0.0],
                 [matrix.c, matrix.d, 0.0, 0.0],
                 [0.0, 0.0, 1.0, 0.0],
                 [
-                    matrix.tx.to_pixels() as f32,
-                    matrix.ty.to_pixels() as f32,
+                    matrix.tx.to_pixels() as f32 - self.rect.x as f32,
+                    matrix.ty.to_pixels() as f32 - self.rect.y as f32,
                     0.0,
                     1.0,
                 ],
@@ -712,19 +734,31 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
 
 impl CommandHandler for WgpuCommandHandler<'_, '_> {
     fn blend(&mut self, commands: CommandList, blend_mode: RenderBlendMode) {
-        let surface = Surface::new(
-            self.descriptors,
-            self.quality,
-            self.width,
-            self.height,
-            wgpu::TextureFormat::Rgba8Unorm,
-        );
         let target_layer = if let RenderBlendMode::Builtin(BlendMode::Layer) = &blend_mode {
             LayerRef::Current
         } else {
             self.nearest_layer
         };
         let blend_type = BlendType::from(blend_mode);
+
+        // Every built-in blend leaves the destination untouched where the
+        // blended group is transparent - the complex-blend shaders `discard`
+        // there, and each trivial blend state is the identity on the
+        // destination for a zero source - so a target that covers only what the
+        // group draws composites to the same picture as a screen-sized one. A
+        // PixelBender blend is arbitrary code that may write anywhere its quad
+        // covers, so it keeps the full-sized target.
+        let rect = match &blend_type {
+            BlendType::Shader(_) => self.rect,
+            _ => target_rect_for(content_bounds(&commands), self.rect),
+        };
+
+        let surface = Surface::for_rect(
+            self.descriptors,
+            self.quality,
+            rect,
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
         let clear_color = blend_type.default_color();
         let target = surface.draw_commands(
             RenderTargetMode::FreshWithColor(clear_color),
@@ -754,7 +788,7 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
         match blend_type {
             BlendType::Trivial(blend_mode) => {
                 let transform = Transform {
-                    matrix: Matrix::scale(target.width() as f32, target.height() as f32),
+                    matrix: rect_matrix(rect),
                     color_transform: Default::default(),
                     perspective_projection: None,
                 };
@@ -813,6 +847,7 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
                     texture: target.take_color_texture(),
                     blend_mode: chunk_blend_mode,
                     needs_stencil: self.num_masks > 0,
+                    rect,
                 });
                 self.needs_stencil = self.num_masks > 0;
             }
@@ -958,11 +993,14 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
     }
 
     fn render_alpha_mask(&mut self, maskee_commands: CommandList, mask_commands: CommandList) {
-        let surface = Surface::new(
+        // The result is the maskee scaled by the mask's alpha, so it is inside
+        // both of them and transparent everywhere else.
+        let bounds = content_bounds(&maskee_commands).intersect(content_bounds(&mask_commands));
+        let rect = target_rect_for(bounds, self.rect);
+        let surface = Surface::for_rect(
             self.descriptors,
             self.quality,
-            self.width,
-            self.height,
+            rect,
             wgpu::TextureFormat::Rgba8Unorm,
         );
 
@@ -978,7 +1016,7 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
             self.texture_pool,
         );
         maskee.ensure_cleared(self.draw_encoder);
-        let matrix = Matrix::scale(maskee.width() as f32, maskee.height() as f32);
+        let matrix = rect_matrix(rect);
         let maskee = maskee.take_color_texture();
 
         let mask = surface.draw_commands(

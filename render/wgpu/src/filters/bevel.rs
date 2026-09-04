@@ -1,4 +1,5 @@
 use crate::backend::RenderTargetMode;
+use crate::bounds::TargetRect;
 use crate::buffer_pool::TexturePool;
 use crate::descriptors::Descriptors;
 use crate::filters::blur::BlurFilter;
@@ -188,11 +189,7 @@ impl BevelFilter {
         let target = CommandTarget::new(
             descriptors,
             texture_pool,
-            wgpu::Extent3d {
-                width: source.size.0,
-                height: source.size.1,
-                depth_or_array_layers: 1,
-            },
+            TargetRect::from_size(source.size.0, source.size.1),
             format,
             sample_count,
             RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),

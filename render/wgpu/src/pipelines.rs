@@ -150,7 +150,7 @@ impl Pipelines {
                 format,
                 &shaders.blend_shaders[blend],
                 msaa_sample_count,
-                &VERTEX_BUFFERS_DESCRIPTION_POS,
+                &VERTEX_BUFFERS_DESCRIPTION_POS_UV,
                 &complex_blend_bindings,
                 BlendState::REPLACE,
                 0,
