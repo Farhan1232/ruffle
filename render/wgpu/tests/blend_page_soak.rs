@@ -566,16 +566,71 @@ fn a_long_session_settles() {
     );
 
     // The reserve is what the driver's allocator keeps in order to serve the
-    // allocations, and it is the part that shows up in the process's private
-    // bytes without appearing in any count of live textures. It may grow to
-    // meet a scene; it may not keep growing once the scenes repeat.
-    if first.allocator_reserved > 0 {
+    // allocations. It is the part that shows up in the process's private bytes
+    // without appearing in any count of live textures, and it is the shape of
+    // the memory the client's Windows run could not account for.
+    //
+    // It cannot be tested by comparing its first reading with its last. A
+    // suballocator takes and releases whole blocks, so a scene whose demand
+    // rises and falls makes this oscillate between two values - here between
+    // two blocks and three - and which of them a run happens to end on says
+    // nothing. What matters is the ceiling: a reserve that is really ratcheting
+    // reaches a higher one in the second half of a long run than it did in the
+    // first, and one that has found its high-water mark does not.
+    let reserve_max = |cycles: &[CycleCost]| {
+        cycles
+            .iter()
+            .map(|c| c.allocator_reserved)
+            .max()
+            .unwrap_or(0)
+    };
+    let reserve_min = |cycles: &[CycleCost]| {
+        cycles
+            .iter()
+            .map(|c| c.allocator_reserved)
+            .min()
+            .unwrap_or(0)
+    };
+    let early_reserve = reserve_max(&settled[..half]);
+    let late_reserve = reserve_max(&settled[half..]);
+    println!(
+        "allocator reserve: {:.1}-{:.1} MB over the first {half} settled cycles, \
+         {:.1}-{:.1} MB over the last {}",
+        reserve_min(&settled[..half]) as f64 / (1024.0 * 1024.0),
+        early_reserve as f64 / (1024.0 * 1024.0),
+        reserve_min(&settled[half..]) as f64 / (1024.0 * 1024.0),
+        late_reserve as f64 / (1024.0 * 1024.0),
+        settled.len() - half,
+    );
+    if early_reserve > 0 {
         assert!(
-            last.allocator_reserved <= first.allocator_reserved * 3 / 2,
-            "the allocator reserved {:.1} MB after the first settled cycle and {:.1} MB \
-             at the end; it is ratcheting",
-            first.allocator_reserved as f64 / (1024.0 * 1024.0),
-            last.allocator_reserved as f64 / (1024.0 * 1024.0),
+            late_reserve <= early_reserve,
+            "the allocator's reserve peaked at {:.1} MB over the first half of the run \
+             and at {:.1} MB over the second; it is ratcheting",
+            early_reserve as f64 / (1024.0 * 1024.0),
+            late_reserve as f64 / (1024.0 * 1024.0),
+        );
+    }
+
+    // And what is actually in use inside that reserve is the leak test: it is
+    // flat if nothing is accumulating, whatever the reserve around it does.
+    let early_allocated = settled[..half]
+        .iter()
+        .map(|c| c.allocator_allocated)
+        .max()
+        .unwrap_or(0);
+    let late_allocated = settled[half..]
+        .iter()
+        .map(|c| c.allocator_allocated)
+        .max()
+        .unwrap_or(0);
+    if early_allocated > 0 {
+        assert!(
+            late_allocated <= early_allocated * 5 / 4,
+            "the allocator held {:.1} MB at once over the first half of the run and \
+             {:.1} MB over the second; something is accumulating",
+            early_allocated as f64 / (1024.0 * 1024.0),
+            late_allocated as f64 / (1024.0 * 1024.0),
         );
     }
 }
