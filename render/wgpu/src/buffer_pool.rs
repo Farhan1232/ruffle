@@ -48,6 +48,28 @@ pub fn pool_usage() -> PoolUsage {
     }
 }
 
+/// Which sizes a pool should give up so that what it keeps idle fits `budget`.
+///
+/// Sizes are given as `(when it was last asked for, the size, what it is
+/// holding idle)`. The ones least recently wanted go first, so the sizes the
+/// last few frames used are the ones that survive.
+fn sizes_over_budget<Key: Copy>(mut sizes: Vec<(u64, Key, usize)>, budget: usize) -> Vec<Key> {
+    let mut held: usize = sizes.iter().map(|(_, _, bytes)| bytes).sum();
+    if held <= budget {
+        return Vec::new();
+    }
+    sizes.sort_unstable_by_key(|(last_used, _, _)| *last_used);
+    let mut give_up = Vec::new();
+    for (_, key, bytes) in sizes {
+        if held <= budget {
+            break;
+        }
+        held -= bytes;
+        give_up.push(key);
+    }
+    give_up
+}
+
 type PoolInner<T> = Mutex<PoolState<T>>;
 
 /// A pool's free list plus the demand figures the memory report needs.
@@ -189,9 +211,16 @@ impl Drop for PooledTexture {
     }
 }
 
+/// One size's free list, and when that size was last asked for.
+#[derive(Debug)]
+struct SizePool {
+    pool: BufferPool<PooledTexture, AlwaysCompatible>,
+    last_used: u64,
+}
+
 #[derive(Debug)]
 pub struct TexturePool {
-    pools: FnvHashMap<TextureKey, BufferPool<PooledTexture, AlwaysCompatible>>,
+    pools: FnvHashMap<TextureKey, SizePool>,
     /// A projection per target size, with whether anything has asked for it
     /// since the last trim.
     globals_cache: FnvHashMap<GlobalsKey, (Arc<Globals>, bool)>,
@@ -199,6 +228,11 @@ pub struct TexturePool {
     /// (which lives across frames) from the offscreen one (which the renderer
     /// replaces every frame). Reporting only; it changes nothing.
     kind: crate::TextureKind,
+    /// Ticks on every request, so sizes can be ordered by how recently they
+    /// were wanted.
+    clock: u64,
+    /// The most this pool will keep in idle targets.
+    idle_budget: usize,
 }
 
 /// One pool key held by a [`TexturePool`], for the memory report.
@@ -248,11 +282,14 @@ impl TexturePool {
     /// of size classes.
     pub fn trim_idle(&mut self) -> usize {
         let mut released = 0;
-        self.pools.retain(|_, pool| {
-            let (bytes, dormant) = pool.trim_idle(|texture| crate::texture_bytes(&texture.0));
+        self.pools.retain(|_, size_pool| {
+            let (bytes, dormant) = size_pool
+                .pool
+                .trim_idle(|texture| crate::texture_bytes(&texture.0));
             released += bytes;
             if dormant {
-                released += pool
+                released += size_pool
+                    .pool
                     .available()
                     .iter()
                     .map(|(texture, _)| crate::texture_bytes(&texture.0))
@@ -260,15 +297,64 @@ impl TexturePool {
             }
             !dormant
         });
+
+        let idle: Vec<(u64, TextureKey, usize)> = self
+            .pools
+            .iter()
+            .filter(|(_, size_pool)| size_pool.pool.idle_len() > 0)
+            .map(|(key, size_pool)| {
+                (
+                    size_pool.last_used,
+                    *key,
+                    size_pool.pool.idle_len() * key.bytes(),
+                )
+            })
+            .collect();
+        for key in sizes_over_budget(idle, self.idle_budget) {
+            if let Some(size_pool) = self.pools.get_mut(&key) {
+                released += size_pool.pool.idle_len() * key.bytes();
+                size_pool.pool.release_idle();
+                if !size_pool.pool.is_borrowed() {
+                    self.pools.remove(&key);
+                }
+            }
+        }
+
         self.trim_globals();
         released
     }
 
+    /// A pool for the targets a frame is composed from.
+    ///
+    /// Those come in size classes, so there are tens of sizes rather than
+    /// thousands and demand-aware trimming is enough on its own; the budget is
+    /// a backstop, set well above the couple of hundred megabytes a crowded
+    /// room's targets come to.
     pub fn new(kind: crate::TextureKind) -> Self {
+        Self::with_idle_budget(kind, 256 * 1024 * 1024)
+    }
+
+    /// A pool for the scratch space filters and offscreen draws run through.
+    ///
+    /// These sizes follow the content - a filter's targets are exactly its
+    /// source's size, which changes whenever a cached object's bounds do - so a
+    /// scene of animating filtered objects meets thousands of them. Keeping a
+    /// few of every size ever seen is how this pool reached 3,673 sizes and 2.5
+    /// GiB in a harness of forty rotating filtered avatars. What is worth
+    /// keeping is the handful of sizes the last few frames used, a few
+    /// megabytes; the budget is set an order of magnitude above that, and the
+    /// sizes given up when it bites are the ones least recently wanted.
+    pub fn new_offscreen(kind: crate::TextureKind) -> Self {
+        Self::with_idle_budget(kind, 64 * 1024 * 1024)
+    }
+
+    fn with_idle_budget(kind: crate::TextureKind, idle_budget: usize) -> Self {
         Self {
             pools: Default::default(),
             globals_cache: Default::default(),
             kind,
+            clock: 0,
+            idle_budget,
         }
     }
 
@@ -287,8 +373,10 @@ impl TexturePool {
             sample_count,
         };
         let kind = self.kind;
+        self.clock += 1;
+        let clock = self.clock;
         let mut fresh_key = false;
-        let pool = self.pools.entry(key).or_insert_with(|| {
+        let size_pool = self.pools.entry(key).or_insert_with(|| {
             fresh_key = true;
             let label = if cfg!(feature = "render_debug_labels") {
                 use std::sync::atomic::{AtomicU32, Ordering};
@@ -298,7 +386,7 @@ impl TexturePool {
             } else {
                 None
             };
-            BufferPool::new(Box::new(move |descriptors, _description| {
+            let pool = BufferPool::new(Box::new(move |descriptors, _description| {
                 let texture = descriptors.device.create_texture(&wgpu::TextureDescriptor {
                     label: label.as_deref(),
                     size,
@@ -311,17 +399,22 @@ impl TexturePool {
                 });
                 let view = texture.create_view(&Default::default());
                 PooledTexture::new(texture, view, kind)
-            }))
+            }));
+            SizePool {
+                pool,
+                last_used: clock,
+            }
         });
+        size_pool.last_used = clock;
         if fresh_key {
-            pool.note_new_key();
+            size_pool.pool.note_new_key();
         }
         POOL_TAKES.fetch_add(1, Ordering::Relaxed);
         POOL_PIXELS.fetch_add(
             u64::from(size.width) * u64::from(size.height),
             Ordering::Relaxed,
         );
-        pool.take(descriptors, AlwaysCompatible)
+        size_pool.pool.take(descriptors, AlwaysCompatible)
     }
 
     /// `(distinct sizes pooled, textures idle in free lists, their bytes)`.
@@ -335,7 +428,7 @@ impl TexturePool {
         let mut textures = 0;
         let mut bytes = 0;
         for pool in self.pools.values() {
-            for (texture, _) in pool.available().iter() {
+            for (texture, _) in pool.pool.available().iter() {
                 textures += 1;
                 bytes += crate::texture_bytes(&texture.0);
             }
@@ -351,8 +444,8 @@ impl TexturePool {
             .pools
             .iter_mut()
             .map(|(key, pool)| {
-                let stats = pool.stats();
-                let available = pool.available();
+                let stats = pool.pool.stats();
+                let available = pool.pool.available();
                 let idle_bytes = available
                     .iter()
                     .map(|(texture, _)| crate::texture_bytes(&texture.0))
@@ -429,6 +522,18 @@ struct TextureKey {
     usage: wgpu::TextureUsages,
     format: wgpu::TextureFormat,
     sample_count: u32,
+}
+
+impl TextureKey {
+    /// What one texture of this size costs, near enough to budget with.
+    fn bytes(&self) -> usize {
+        let block = self.format.block_copy_size(None).unwrap_or(4) as usize;
+        self.size.width as usize
+            * self.size.height as usize
+            * self.size.depth_or_array_layers as usize
+            * block
+            * self.sample_count as usize
+    }
 }
 
 #[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
@@ -546,6 +651,21 @@ impl<Type, Description: BufferDescription> BufferPool<Type, Description> {
             state.misses_new_key,
             state.retained_target,
         )
+    }
+
+    /// How many entries are sitting unused.
+    fn idle_len(&self) -> usize {
+        self.lock().available.len()
+    }
+
+    /// Whether anything is currently using an entry from this pool.
+    fn is_borrowed(&self) -> bool {
+        self.lock().borrowed > 0
+    }
+
+    /// Gives up every idle entry, for when the pool is over its budget.
+    fn release_idle(&mut self) {
+        self.lock().available.clear();
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, PoolState<(Type, Description)>> {

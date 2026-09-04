@@ -497,7 +497,7 @@ impl DrawCommand {
 ///
 /// Compositing a sub-target back is a quad of exactly that shape, so this puts
 /// its texture where its contents were.
-pub fn rect_matrix(rect: TargetRect) -> Matrix {
+fn rect_matrix(rect: TargetRect) -> Matrix {
     Matrix {
         a: rect.width as f32,
         b: 0.0,

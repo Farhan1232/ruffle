@@ -124,11 +124,8 @@ fn main() -> Result<()> {
         .init();
     let opt = Opt::parse();
 
-    let instance = create_wgpu_instance(
-        wgpu::Backends::all(),
-        wgpu::BackendOptions::default(),
-        None,
-    );
+    let instance =
+        create_wgpu_instance(wgpu::Backends::all(), wgpu::BackendOptions::default(), None);
     let (adapter, device, queue) = futures::executor::block_on(request_adapter_and_device(
         wgpu::Backends::all(),
         &instance,
@@ -223,7 +220,11 @@ fn main() -> Result<()> {
                 report.tracked_textures,
                 report.tracked_texture_bytes / (1024 * 1024),
                 report.peak_texture_bytes / (1024 * 1024),
-                report.texture_kind_live_counts.get(3).copied().unwrap_or_default(),
+                report
+                    .texture_kind_live_counts
+                    .get(3)
+                    .copied()
+                    .unwrap_or_default(),
                 report
                     .texture_kind_live_bytes
                     .get(3)
