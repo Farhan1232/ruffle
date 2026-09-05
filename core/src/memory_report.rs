@@ -639,6 +639,48 @@ mod tests {
             "allocator_allocated_bytes",
             "allocator_reserved_bytes",
             "hal_textures",
+            // The loading timeline the Windows run is read through.
+            "elapsed_s",
+            "movies",
+            "characters",
+            "swf_bytes",
+            "bitmap_source_bytes",
+            "bitmap_decoded_bytes",
+            "pending_loaders",
+            "gc_allocation",
+            "gc_objects",
+            "gc_external_bytes",
+            // Live alone cannot tell a pool that is churning from one that is
+            // holding, so created and dropped are required beside it.
+            "tracked_textures",
+            "textures_created",
+            "texture_bytes_created",
+            "textures_dropped",
+            "texture_bytes_dropped",
+            "pool_reuses",
+            "pool_misses",
+            "main_pool_idle_textures",
+            "main_pool_idle_bytes",
+            "main_pool_size_classes",
+            "offscreen_pool_idle_textures",
+            "offscreen_pool_idle_bytes",
+            "offscreen_pool_size_classes",
+            // The HAL counters that read zero on some drivers. The column has
+            // to exist for "this driver does not report it" to be
+            // distinguishable from "this build never reported it".
+            "hal_bind_group_layouts",
+            "hal_compute_pipelines",
+            "hal_pipeline_layouts",
+            "hal_query_sets",
+            "hal_fences",
+            // A stall attributed rather than only counted.
+            "render_slow_ns_cache_entries",
+            "render_slow_ns_frame_commands",
+            "render_slow_ns_queue_submit",
+            // Destination copies are a per-frame cost, and the cumulative
+            // column cannot be divided back out.
+            "destination_copies_last_frame",
+            "destination_copy_pixels_last_frame",
         ] {
             assert!(
                 columns.contains(&wanted),

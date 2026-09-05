@@ -1217,4 +1217,47 @@ mod tests {
         }
         assert_eq!(state.available.len(), 6);
     }
+
+    /// The idle budget only takes memory away when there is too much of it.
+    /// Restored on the diagnostic branch: the instrumentation rewrite of this
+    /// file dropped this test and the one below it, so the build the client's
+    /// run is measured with had two fewer guarantees about the pool than the
+    /// production build it is meant to represent.
+    #[test]
+    fn a_pool_inside_its_budget_gives_up_nothing() {
+        let sizes: Vec<(u64, u32, usize)> = (0..20u32).map(|i| (u64::from(i), i, 1024)).collect();
+        assert!(sizes_over_budget(sizes, 64 * 1024).is_empty());
+    }
+
+    /// And when there is too much, what it keeps is bounded and is the most
+    /// recently wanted - which is what stops a pool of many sizes growing
+    /// without limit.
+    #[test]
+    fn the_idle_budget_bounds_a_pool_of_many_sizes() {
+        const TARGET: usize = 1024 * 1024;
+        let sizes: Vec<(u64, u32, usize)> = (0..3673u32)
+            .map(|i| (u64::from(i), i, 4 * TARGET))
+            .collect();
+        let budget = 64 * TARGET;
+        let given_up = sizes_over_budget(sizes.clone(), budget);
+
+        let kept: usize = sizes
+            .iter()
+            .filter(|(_, key, _)| !given_up.contains(key))
+            .map(|(_, _, bytes)| bytes)
+            .sum();
+        assert!(
+            kept <= budget,
+            "kept {kept} bytes against a {budget} byte budget"
+        );
+        // What survives is what was wanted most recently.
+        assert!(
+            !given_up.contains(&3672),
+            "gave up the size the last frame used"
+        );
+        assert!(
+            given_up.contains(&0),
+            "kept the size nothing has used since"
+        );
+    }
 }

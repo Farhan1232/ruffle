@@ -68,8 +68,44 @@ $required = @(
     'offscreen_pool_hits','offscreen_pool_evictions','offscreen_pool_evicted_bytes',
     'offscreen_pool_size_classes_seen','main_pool_hits',
     'offscreen_miss_new_size_class','offscreen_miss_evicted_by_budget',
-    'offscreen_miss_free_list_empty','offscreen_miss_bytes_free_list_empty'
+    'offscreen_miss_free_list_empty','offscreen_miss_bytes_free_list_empty',
+    # the loading timeline: what the content itself brought in, and what is
+    # still on its way. The 0-30 / 30-60 / 60-120 second breakdown is read
+    # from these, so a run without them cannot answer the loading question.
+    'elapsed_s','movies','characters','swf_bytes',
+    'bitmap_source_bytes','bitmap_decoded_bytes','pending_loaders',
+    # the collector, whose external-byte pacing is what ties Ruffle's own
+    # accounting to the textures the renderer holds
+    'gc_allocation','gc_objects','gc_external_bytes',
+    # textures live, created and dropped. Live alone cannot tell a pool that
+    # is churning from one that is holding, which is the whole phase 2 question.
+    'tracked_textures','textures_created','texture_bytes_created',
+    'textures_dropped','texture_bytes_dropped','peak_gpu_texture_bytes_sampled',
+    'pool_reuses','pool_misses',
+    'main_pool_idle_textures','main_pool_idle_bytes','main_pool_size_classes',
+    'offscreen_pool_idle_textures','offscreen_pool_idle_bytes','offscreen_pool_size_classes',
+    # the rest of the HAL counters. Some of these read zero on some drivers -
+    # that is a finding about the driver, and it needs the column to be present
+    # to be distinguishable from a build that never reported it at all.
+    'hal_bind_group_layouts','hal_compute_pipelines','hal_pipeline_layouts',
+    'hal_query_sets','hal_fences',
+    # slow frames, split the same way as the whole frame, so a stall can be
+    # attributed rather than only counted
+    'render_slow_ns_cache_entries','render_slow_ns_frame_commands',
+    'render_slow_ns_queue_submit',
+    'frame_ms_p50','frame_ms_max','frames_over_33ms','frames_over_100ms',
+    # destination copies per frame as well as cumulative: the cost is a
+    # per-frame one, and the cumulative column cannot be divided back out
+    'destination_copies_last_frame','destination_copy_pixels_last_frame'
 )
+
+# Every column the report below actually reads, found in this script's own
+# source rather than repeated by hand. A figure that is printed but not
+# required is the one way this check can pass while the number above it is
+# invented, so the two lists are tied together here instead of by memory.
+$printed = Select-String -Path $PSCommandPath -Pattern "(?:Last|Max)\s+'([a-z0-9_]+)'" -AllMatches |
+    ForEach-Object { $_.Matches } | ForEach-Object { $_.Groups[1].Value }
+$required = @($required + $printed | Sort-Object -Unique)
 
 if (-not (Test-Path $csvPath)) {
     Fail "aqw-memory.csv is missing"
@@ -81,6 +117,17 @@ $columns = $rows[0].PSObject.Properties.Name
 $missing = $required | Where-Object { $columns -notcontains $_ }
 if ($missing) { Fail "aqw-memory.csv is missing columns: $($missing -join ', ')" }
 else { Pass "all $($required.Count) required columns are present ($($columns.Count) in total)" }
+
+# A row that is short of the header is a truncated write - the last row of a
+# run that was killed mid-line is the usual one. Import-Csv fills the gap with
+# empty strings, which read back as zero, so it has to be caught here.
+$width = (Get-Content $csvPath -TotalCount 1).Split(',').Count
+$ragged = @(Get-Content $csvPath | Select-Object -Skip 1 |
+    Where-Object { $_.Trim() } |
+    Where-Object { $_.Split(',').Count -ne $width }).Count
+if ($ragged -gt 0) { Fail "$ragged row(s) do not have the header's $width fields - the log is truncated" }
+else { Pass "every row has the header's $width fields" }
+
 if ($script:failed) { Write-Host "`nStop here and send me this output." -ForegroundColor Yellow; exit 1 }
 
 # --- the result --------------------------------------------------------------
@@ -103,10 +150,29 @@ Write-Host "=== MEMORY ===================================================="
 "final Rust heap           (rust_heap_bytes)          {0,8:N0} MB" -f ((Last 'rust_heap_bytes')/1MB)
 Write-Host ""
 Write-Host "=== WHERE THE REST OF THE MEMORY IS ==========================="
-"graphics driver allocations (hal_memory_allocations) {0,8:N0}" -f (Last 'hal_memory_allocations')
+# Two of wgpu 30.0.1's HAL counters are never populated, and a bare "0" beside
+# a live texture count reads as a finding rather than as a gap in the
+# instrumentation. Verified in the vendored crate source, not inferred from the
+# reading: wgpu-hal's Vulkan `create_texture` never increments
+# `counters.textures` while `destroy_texture` decrements it, so the figure runs
+# negative and Ruffle clamps it to zero; and `counters.memory_allocations` is
+# written by no backend at all. Neither is a driver limitation, so neither will
+# populate on the client's card either. `allocator_*` carries this section.
+$halTexturesUnreported = ((Last 'hal_textures') -eq 0) -and ((Max 'tracked_textures') -gt 0)
+if ((Last 'hal_memory_allocations') -eq 0) {
+    "graphics driver allocations (hal_memory_allocations)      n/a   wgpu 30.0.1 populates it on no backend"
+} else {
+    "graphics driver allocations (hal_memory_allocations) {0,8:N0}" -f (Last 'hal_memory_allocations')
+}
 "  their live bytes    (allocator_allocated_bytes)    {0,8:N0} MB" -f ((Last 'allocator_allocated_bytes')/1MB)
 "  their block bytes   (allocator_reserved_bytes)     {0,8:N0} MB   the gap is memory the allocator owns and is not using" -f ((Last 'allocator_reserved_bytes')/1MB)
-"live backend textures     (hal_textures)             {0,8:N0}   against tracked_textures {1,0:N0}" -f (Last 'hal_textures'), (Last 'tracked_textures')
+"  blocks the allocator holds (allocator_blocks)      {0,8:N0}" -f (Last 'allocator_blocks')
+if ($halTexturesUnreported) {
+    "live backend textures     (hal_textures)                  n/a   not counted on wgpu's vulkan backend; tracked_textures is {0,0:N0}" -f (Last 'tracked_textures')
+} else {
+    "live backend textures     (hal_textures)             {0,8:N0}   against tracked_textures {1,0:N0}" -f (Last 'hal_textures'), (Last 'tracked_textures')
+}
+"live backend texture memory(hal_texture_memory)       {0,8:N0} MB   this one is populated on vulkan" -f ((Last 'hal_texture_memory')/1MB)
 "live backend texture views(hal_texture_views)        {0,8:N0}" -f (Last 'hal_texture_views')
 "live backend bind groups  (hal_bind_groups)          {0,8:N0}" -f (Last 'hal_bind_groups')
 "live backend buffers      (hal_buffers)              {0,8:N0}" -f (Last 'hal_buffers')

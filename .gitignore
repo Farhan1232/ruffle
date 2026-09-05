@@ -33,3 +33,6 @@ diagnostic-*.txt
 *-memory.csv
 *-windows-ram.csv
 *-console.log
+aqw-final-auto/
+aqw-windows-*/
+schema-probe.csv
