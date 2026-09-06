@@ -1483,11 +1483,16 @@ pub async fn request_adapter_and_device(
 ///
 /// `MemoryHints::MemoryUsage` asks for 8 to 64 MB device blocks and 4 to 32 MB
 /// host blocks, which is the same allocator with a quarter of the waste per
-/// pinned block. It costs more `vkAllocateMemory` calls, which this content
-/// makes few of - the offscreen pool serves 84.5% of its requests from idle
-/// textures - so it is on by default.
+/// pinned block.
 ///
-/// `RUFFLE_DEVICE_MEMORY` overrides it, for A/B without a rebuild:
+/// It is not the default, because the measurement came back against it: see
+/// [`crate::tuning::frugal_device_memory_enabled`]. Smaller blocks move the
+/// fragmentation from inside the blocks to between them, and on a soak here
+/// that ratcheted where the default did not. It is worth trying on the
+/// client's machine, whose ratio is four times worse than this one's, and that
+/// is what the environment variable is for.
+///
+/// `RUFFLE_DEVICE_MEMORY` selects it, for A/B without a rebuild:
 ///
 /// * `performance` - wgpu's default, the phase 2 behaviour.
 /// * `memory` - small blocks.

@@ -845,7 +845,7 @@ pub mod tuning {
     static BLEND_BATCHING: AtomicBool = AtomicBool::new(true);
     static CACHE_POOL: AtomicBool = AtomicBool::new(true);
     static MULTIPLY_ON_DRAW: AtomicBool = AtomicBool::new(true);
-    static FRUGAL_DEVICE_MEMORY: AtomicBool = AtomicBool::new(true);
+    static FRUGAL_DEVICE_MEMORY: AtomicBool = AtomicBool::new(false);
 
     /// Whether blended groups share pages instead of each taking a target.
     pub fn blend_pages_enabled() -> bool {
@@ -889,8 +889,22 @@ pub mod tuning {
     /// of reserve across 7 blocks for 319 MB of live allocations.
     ///
     /// `MemoryHints::MemoryUsage` asks for 8-64 MB device blocks and 4-32 MB
-    /// host blocks instead, so the same live set pins a quarter as much. Read
-    /// once, when the device is created; `RUFFLE_DEVICE_MEMORY` overrides it.
+    /// host blocks instead, so the same live set pins a quarter as much - which
+    /// is why it looked like the answer.
+    ///
+    /// It is OFF by default anyway, because the measurement came back against
+    /// it. Two 15-minute soaks here, at a live set of 110 MB: the reserve's
+    /// ceiling rose 156 -> 188 MB in one and 188 -> 220 MB in the other, in
+    /// 32 MB steps, while `Performance` sat at 192 MB in two blocks and did not
+    /// move. More blocks means more of them holding a survivor, and a block is
+    /// only ever freed when it is wholly empty, so the fragmentation moves from
+    /// inside the blocks to between them. Whether that trade is worth taking
+    /// depends on the ratio, and the ratio on the client's machine (319 MB live
+    /// in 1,472 MB reserved) is nothing like the one here, so it is a switch to
+    /// be measured there rather than a default to be assumed.
+    ///
+    /// Read once, when the device is created; `RUFFLE_DEVICE_MEMORY` overrides
+    /// it.
     pub fn frugal_device_memory_enabled() -> bool {
         FRUGAL_DEVICE_MEMORY.load(Ordering::Relaxed)
     }
