@@ -17,7 +17,7 @@ use crate::context::UpdateContext;
 
 /// Identifies this instrumentation, so a log can be tied to the build that
 /// produced it. Bump it whenever the columns change.
-pub const INSTRUMENTATION_VERSION: &str = "aqw-final-diag-4";
+pub const INSTRUMENTATION_VERSION: &str = "aqw-final-diag-5";
 
 /// What a single still-resident movie is keeping alive.
 #[derive(Debug, Clone)]
@@ -263,6 +263,9 @@ impl MemoryReport {
              destination_copies_last_frame,destination_copy_pixels_last_frame,\
              complex_blends,complex_blend_passes",
         );
+        // Phase 3: multiplies carried by the draw that produced them.
+        header
+            .push_str(",multiply_on_draw_used,multiply_on_draw_shape,multiply_on_draw_transparent");
         // Phase 2: what the caches and the offscreen pool allocate, and why.
         header.push_str(
             ",cache_redraws,cache_texture_kept,cache_allocated_pixels,\
@@ -411,6 +414,13 @@ impl MemoryReport {
             self.work.destination_copy_pixels_last_frame,
             self.work.complex_blends,
             self.work.complex_blend_passes,
+        );
+        let _ = write!(
+            row,
+            ",{},{},{}",
+            self.work.multiply_on_draw_used,
+            self.work.multiply_on_draw_shape,
+            self.work.multiply_on_draw_transparent,
         );
         let _ = write!(
             row,

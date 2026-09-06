@@ -1,10 +1,10 @@
-# Checks an AQW diagnostic log package and prints the result.
+﻿# Checks an AQW diagnostic log package and prints the result.
 #
 # Every figure it prints names the CSV column it came from, so that nothing in
 # the output looks like a column that does not exist.
 param(
     [string]$Dir = "$PWD",
-    [string]$ExpectedInstrumentation = "aqw-final-diag-4"
+    [string]$ExpectedInstrumentation = "aqw-final-diag-5"
 )
 
 $ErrorActionPreference = "Stop"
@@ -57,6 +57,8 @@ $required = @(
     'batch_eligible','batch_used','pages_last_frame','page_bytes_last_frame','peak_page_bytes',
     'destination_copies','destination_copy_pixels','complex_blends','complex_blend_passes',
     'page_fallback_alpha_mask','page_fallback_masked','page_fallback_nested_blend',
+    # phase 3: multiplies carried by the draw that produced them
+    'multiply_on_draw_used','multiply_on_draw_shape','multiply_on_draw_transparent',
     # phase 2: what the caches and the offscreen pool allocate, and why
     'cache_redraws','cache_texture_kept','cache_allocated_pixels',
     'cache_pool_takes','cache_pool_hits','cache_pool_builds',
@@ -134,7 +136,14 @@ if ($script:failed) { Write-Host "`nStop here and send me this output." -Foregro
 function Max($column) { ($rows | ForEach-Object { [double]$_.$column } | Measure-Object -Maximum).Maximum }
 function Last($column) { [double]$rows[-1].$column }
 
-$drawn = $rows | Where-Object { [int]$_.frames -gt 0 }
+# The player keeps ticking while its window is occluded and does not render, so
+# an alt-tabbed five seconds arrives as tens of thousands of samples microseconds
+# apart. Left in, two such windows out of 481 dragged a whole run's mean frame
+# time to 0.2 ms. A window is only counted if its tick rate is one a display
+# could have produced: the interval is five seconds, so 500 is over 100 a second.
+$sampled = $rows | Where-Object { [int]$_.frames -gt 0 }
+$drawn = $sampled | Where-Object { [int]$_.frames -le 500 }
+$occluded = $sampled.Count - $drawn.Count
 $frames = ($drawn | ForEach-Object { [int]$_.frames } | Measure-Object -Sum).Sum
 $weighted = 0; $drawn | ForEach-Object { $weighted += [double]$_.frame_ms_mean * [int]$_.frames }
 $meanFrame = if ($frames) { $weighted / $frames } else { 0 }
@@ -197,6 +206,9 @@ Write-Host "=== FRAME TIME ================================================"
 "frames drawn              (frames)                   {0,8:N0}" -f $frames
 "mean frame time           (frame_ms_mean)            {0,8:N1} ms   target under 41.7" -f $meanFrame
 "5-second windows over budget                         {0,8:N0} of {1,0:N0}" -f $overBudget, $drawn.Count
+if ($occluded -gt 0) {
+    "  {0,0:N0} window(s) left out: the window was not on screen and nothing was drawn" -f $occluded
+}
 $total = Last 'render_ns_total'
 if ($total -gt 0) {
     "renderer's own share of that time, split by phase:"
@@ -249,6 +261,19 @@ $cb = Last 'complex_blends'; $cp = Last 'complex_blend_passes'
 foreach ($c in $columns | Where-Object { $_ -like 'page_fallback_*' }) {
     $v = Last $c
     if ($v -gt 0) { "  {0,-44} {1,8:N0}" -f $c, $v }
+}
+
+Write-Host ""
+Write-Host "=== MULTIPLY ON DRAW (phase 3) ================================="
+$mu = Last 'multiply_on_draw_used'
+$ms = Last 'multiply_on_draw_shape'
+$mt = Last 'multiply_on_draw_transparent'
+$offered = $mu + $ms + $mt
+"multiplies carried by their draw (multiply_on_draw_used) {0,8:N0}   {1,5:N1}% of {2:N0} multiplies" -f $mu, $(if ($offered -gt 0) { 100 * $mu / $offered } else { 0 }), $offered
+"  refused: destination not opaque                        {0,8:N0}" -f $mt
+"  refused: the single draw was a shape                   {0,8:N0}   what shape pipelines would win" -f $ms
+if ($cb -gt 0) {
+    "complex blends left for the shader                       {0,8:N0}   was 8,417,623 before this" -f $cb
 }
 
 if (Test-Path $ramPath) {

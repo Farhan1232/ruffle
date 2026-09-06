@@ -229,6 +229,12 @@ pub struct RenderWorkUsage {
     /// Why the rest did not, in the order of `fallback_names`.
     pub fallback_names: &'static [&'static str],
     pub fallbacks: Vec<u64>,
+    /// Multiplies carried by their own draw, which is a subset of
+    /// `fastpath_used`, and the two reasons the rest were not: the destination
+    /// was not known opaque, or the group's single draw was a shape.
+    pub multiply_on_draw_used: u64,
+    pub multiply_on_draw_shape: u64,
+    pub multiply_on_draw_transparent: u64,
     /// Where the renderer's share of the frames went, in nanoseconds. The rest
     /// of a frame is ActionScript, collection and the display list, which the
     /// renderer cannot see; the frontend's frame time minus `render_ns_total`
