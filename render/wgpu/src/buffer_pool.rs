@@ -102,9 +102,20 @@ pub enum PoolMiss {
     /// flags.
     UsageMismatch,
     /// A size it held and gave up to stay inside its idle budget, asked for
-    /// again. This is the category that says the budget is too small rather
-    /// than that the content is too varied.
+    /// again before it had been re-admitted. This is the category that says the
+    /// budget is too small rather than that the content is too varied.
     EvictedByBudget,
+    /// A size it held and forgot because nothing had asked for it in several
+    /// trim intervals, asked for again.
+    ///
+    /// Split out from [`Self::EvictedByBudget`] because the two want opposite
+    /// fixes and were being reported as one: a key entered the evicted set on
+    /// its first budget eviction and was never taken out again, so every later
+    /// dormancy drop of that same size was reported as the budget biting. A
+    /// large number here says sizes are going quiet and coming back, which is
+    /// what quantising them would cure; a large number in the other says the
+    /// budget is too small for the working set.
+    Dormant,
     /// The key was registered and every texture under it was already lent out.
     /// This one is not waste - the frame really is using them all at once.
     FreeListEmpty,
@@ -116,10 +127,11 @@ pub const POOL_MISS_NAMES: &[&str] = &[
     "sample_count_mismatch",
     "usage_mismatch",
     "evicted_by_budget",
+    "dormant",
     "free_list_empty",
 ];
 
-const MISS_REASONS: usize = 6;
+const MISS_REASONS: usize = 7;
 const POOL_KINDS: usize = 2;
 
 #[expect(clippy::declare_interior_mutable_const)]
@@ -395,7 +407,15 @@ pub struct TexturePool {
     /// Keys this pool gave up to stay inside its budget. A request for one of
     /// these is the budget's fault rather than the content's, and the two want
     /// opposite fixes.
+    ///
+    /// A key leaves this set the moment it is registered again, so it means
+    /// "given up and not yet asked for since". Without that it only ever grew,
+    /// and every later dormancy drop of a size that had once been over budget
+    /// was reported as the budget biting.
     evicted: FnvHashSet<TextureKey>,
+    /// Keys this pool forgot because nothing asked for them for several trim
+    /// intervals. Kept and cleared on the same terms as `evicted`.
+    dormant: FnvHashSet<TextureKey>,
 }
 
 /// One pool key held by a [`TexturePool`], for the memory report.
@@ -445,7 +465,8 @@ impl TexturePool {
     /// of size classes.
     pub fn trim_idle(&mut self) -> usize {
         let mut released = 0;
-        self.pools.retain(|_, size_pool| {
+        let mut forgotten: Vec<TextureKey> = Vec::new();
+        self.pools.retain(|key, size_pool| {
             let (bytes, dormant) = size_pool
                 .pool
                 .trim_idle(|texture| crate::texture_bytes(&texture.0));
@@ -457,9 +478,16 @@ impl TexturePool {
                     .iter()
                     .map(|(texture, _)| crate::texture_bytes(&texture.0))
                     .sum::<usize>();
+                forgotten.push(*key);
             }
             !dormant
         });
+        for key in forgotten {
+            if self.dormant.len() >= 16_384 {
+                self.dormant.clear();
+            }
+            self.dormant.insert(key);
+        }
         released += self.enforce_idle_budget();
         self.trim_globals();
         self.publish_size_report();
@@ -546,6 +574,7 @@ impl TexturePool {
             pool_kind,
             size_history: Default::default(),
             evicted: Default::default(),
+            dormant: Default::default(),
         }
     }
 
@@ -569,6 +598,9 @@ impl TexturePool {
         // Classified before the entry is made, because the answer depends on
         // what the map held when the request arrived.
         let miss_reason = self.classify_miss(&key);
+        if miss_reason.is_some() {
+            self.re_admit(&key);
+        }
         let mut fresh_key = false;
         let size_pool = self.pools.entry(key).or_insert_with(|| {
             fresh_key = true;
@@ -617,6 +649,18 @@ impl TexturePool {
         entry
     }
 
+    /// Takes `key` back off the two given-up lists, because it is about to be
+    /// registered again.
+    ///
+    /// Without this the lists only ever grew, and a size that had been over
+    /// budget once was reported as the budget biting every time it later went
+    /// quiet and was forgotten - which is a different problem with a different
+    /// fix.
+    fn re_admit(&mut self, key: &TextureKey) {
+        self.evicted.remove(key);
+        self.dormant.remove(key);
+    }
+
     /// Why a request for `key` cannot be served from a free list, if it
     /// cannot. `None` means the key is registered and might have one.
     fn classify_miss(&self, key: &TextureKey) -> Option<PoolMiss> {
@@ -625,6 +669,9 @@ impl TexturePool {
         }
         if self.evicted.contains(key) {
             return Some(PoolMiss::EvictedByBudget);
+        }
+        if self.dormant.contains(key) {
+            return Some(PoolMiss::Dormant);
         }
         // Which part of the key is the new one, checked from the most specific
         // outwards, so a request that differs only in usage is not reported as
@@ -1102,6 +1149,59 @@ mod tests {
         for entry in taken {
             state.restore(entry);
         }
+    }
+
+    fn a_key(width: u32) -> TextureKey {
+        TextureKey {
+            size: wgpu::Extent3d {
+                width,
+                height: 64,
+                depth_or_array_layers: 1,
+            },
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            sample_count: 1,
+        }
+    }
+
+    /// A size given up to the budget and a size forgotten for want of demand
+    /// are different problems and have to be reported as different problems.
+    ///
+    /// They were not: a key entered the evicted list on its first budget
+    /// eviction and never left it, so every later dormancy drop of that size
+    /// was reported as the budget biting. In the client's 40-minute session
+    /// that bucket held 87,341 of 192,635 misses, which pointed at a budget
+    /// that the same log shows was never close to full - 40 MB held against
+    /// 192 MB allowed.
+    #[test]
+    fn the_budget_and_dormancy_are_told_apart() {
+        let mut pool = TexturePool::new_offscreen(crate::TextureKind::PoolOffscreen);
+        let key = a_key(100);
+
+        pool.evicted.insert(key);
+        assert_eq!(
+            pool.classify_miss(&key),
+            Some(PoolMiss::EvictedByBudget),
+            "a size the budget gave up is the budget's doing"
+        );
+
+        // Asked for again, so it is registered again and is nobody's fault
+        // until something else happens to it.
+        pool.re_admit(&key);
+        pool.dormant.insert(key);
+        assert_eq!(
+            pool.classify_miss(&key),
+            Some(PoolMiss::Dormant),
+            "a size forgotten for want of demand is not the budget's doing"
+        );
+
+        pool.re_admit(&key);
+        assert_eq!(
+            pool.classify_miss(&key),
+            Some(PoolMiss::NewSizeClass),
+            "a size on neither list is one the pool is not holding for any \
+             reason of its own"
+        );
     }
 
     /// The bug this guards against: a scene that briefly needs many targets at

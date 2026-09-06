@@ -69,7 +69,7 @@ $required = @(
     'cache_alloc_height_exceeded','cache_alloc_shrank','cache_alloc_refused',
     'offscreen_pool_hits','offscreen_pool_evictions','offscreen_pool_evicted_bytes',
     'offscreen_pool_size_classes_seen','main_pool_hits',
-    'offscreen_miss_new_size_class','offscreen_miss_evicted_by_budget',
+    'offscreen_miss_new_size_class','offscreen_miss_evicted_by_budget','offscreen_miss_dormant',
     'offscreen_miss_free_list_empty','offscreen_miss_bytes_free_list_empty',
     # the loading timeline: what the content itself brought in, and what is
     # still on its way. The 0-30 / 30-60 / 60-120 second breakdown is read

@@ -1471,6 +1471,58 @@ pub async fn request_adapter_and_device(
     Ok((adapter, device, queue))
 }
 
+/// How large a block the graphics allocator should take at a time.
+///
+/// wgpu's default is `MemoryHints::Performance`, which asks `gpu_allocator` for
+/// device blocks of 128 to 256 MB and host blocks of 64 to 128 MB. That
+/// allocator only ever destroys a block once the whole block is empty, so the
+/// block size is also the granularity of what a single surviving allocation can
+/// pin: the client's 40-minute session held 1,472 MB of reserve across 7 blocks
+/// against 319 MB of live allocations, and on Windows that reserve is committed
+/// memory charged to the process.
+///
+/// `MemoryHints::MemoryUsage` asks for 8 to 64 MB device blocks and 4 to 32 MB
+/// host blocks, which is the same allocator with a quarter of the waste per
+/// pinned block. It costs more `vkAllocateMemory` calls, which this content
+/// makes few of - the offscreen pool serves 84.5% of its requests from idle
+/// textures - so it is on by default.
+///
+/// `RUFFLE_DEVICE_MEMORY` overrides it, for A/B without a rebuild:
+///
+/// * `performance` - wgpu's default, the phase 2 behaviour.
+/// * `memory` - small blocks.
+/// * `<min>:<max>` in MB, e.g. `32:128`, for anything in between.
+fn device_memory_hints() -> wgpu::MemoryHints {
+    const MB: u64 = 1024 * 1024;
+
+    match std::env::var("RUFFLE_DEVICE_MEMORY").ok().as_deref() {
+        Some("performance") => return wgpu::MemoryHints::Performance,
+        Some("memory") => return wgpu::MemoryHints::MemoryUsage,
+        Some(manual) => {
+            if let Some((min, max)) = manual.split_once(':')
+                && let (Ok(min), Ok(max)) = (min.trim().parse::<u64>(), max.trim().parse::<u64>())
+                && min > 0
+                && max >= min
+            {
+                return wgpu::MemoryHints::Manual {
+                    suballocated_device_memory_block_size: (min * MB)..(max * MB),
+                };
+            }
+            tracing::warn!(
+                "RUFFLE_DEVICE_MEMORY={manual} is not `performance`, `memory` or `<min>:<max>` \
+                 in MB; using the default"
+            );
+        }
+        None => {}
+    }
+
+    if crate::tuning::frugal_device_memory_enabled() {
+        wgpu::MemoryHints::MemoryUsage
+    } else {
+        wgpu::MemoryHints::Performance
+    }
+}
+
 // We try to request the highest limits we can get away with
 async fn request_device(
     adapter: &wgpu::Adapter,
@@ -1501,7 +1553,7 @@ async fn request_device(
             label: None,
             required_features: features,
             required_limits: limits,
-            memory_hints: Default::default(),
+            memory_hints: device_memory_hints(),
             trace: wgpu::Trace::Off,
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
         })

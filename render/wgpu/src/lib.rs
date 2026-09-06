@@ -845,6 +845,7 @@ pub mod tuning {
     static BLEND_BATCHING: AtomicBool = AtomicBool::new(true);
     static CACHE_POOL: AtomicBool = AtomicBool::new(true);
     static MULTIPLY_ON_DRAW: AtomicBool = AtomicBool::new(true);
+    static FRUGAL_DEVICE_MEMORY: AtomicBool = AtomicBool::new(true);
 
     /// Whether blended groups share pages instead of each taking a target.
     pub fn blend_pages_enabled() -> bool {
@@ -875,6 +876,27 @@ pub mod tuning {
 
     pub fn set_multiply_on_draw_enabled(enabled: bool) {
         MULTIPLY_ON_DRAW.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Whether the graphics allocator is asked for small memory blocks rather
+    /// than the large ones wgpu defaults to.
+    ///
+    /// `gpu_allocator` destroys a block only when the *whole* block is empty
+    /// (`MemoryType::free`), so one surviving allocation pins the block it sits
+    /// in. wgpu's default `MemoryHints::Performance` asks for device blocks of
+    /// 128 to 256 MB and host blocks of 64 to 128 MB, which makes that unit of
+    /// waste very large: the client's 40-minute session ended holding 1,472 MB
+    /// of reserve across 7 blocks for 319 MB of live allocations.
+    ///
+    /// `MemoryHints::MemoryUsage` asks for 8-64 MB device blocks and 4-32 MB
+    /// host blocks instead, so the same live set pins a quarter as much. Read
+    /// once, when the device is created; `RUFFLE_DEVICE_MEMORY` overrides it.
+    pub fn frugal_device_memory_enabled() -> bool {
+        FRUGAL_DEVICE_MEMORY.load(Ordering::Relaxed)
+    }
+
+    pub fn set_frugal_device_memory_enabled(enabled: bool) {
+        FRUGAL_DEVICE_MEMORY.store(enabled, Ordering::Relaxed);
     }
 
     /// Whether released `cacheAsBitmap` textures are recycled instead of
