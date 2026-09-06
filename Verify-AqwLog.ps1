@@ -52,6 +52,8 @@ $required = @(
     'allocator_allocated_bytes','allocator_reserved_bytes','allocator_blocks',
     # the process
     'rss_bytes','peak_rss_bytes','private_bytes','peak_private_bytes','rust_heap_bytes',
+    'committed_private_bytes','committed_mapped_bytes','committed_image_bytes',
+    'committed_private_regions','largest_private_region_bytes',
     'frames','frame_ms_mean','frame_ms_p95','frame_ms_p99',
     # phase 1: pages, batched complex blends, and the destination copies it left
     'batch_eligible','batch_used','pages_last_frame','page_bytes_last_frame','peak_page_bytes',
@@ -201,6 +203,22 @@ foreach ($c in $columns | Where-Object { $_ -like 'fastpath_fallback_*' }) {
     $v = Last $c
     if ($v -gt 0) { "  {0,-44} {1,8:N0}" -f $c, $v }
 }
+Write-Host ""
+Write-Host "=== WHERE THE PRIVATE BYTES ARE ==============================="
+$cp = Last 'committed_private_bytes'; $cm = Last 'committed_mapped_bytes'
+$ci = Last 'committed_image_bytes';   $cr = Last 'committed_private_regions'
+"committed private        (committed_private_bytes)   {0,8:N0} MB over {1:N0} regions" -f ($cp/1MB), $cr
+"  largest single region                              {0,8:N0} MB" -f ((Last 'largest_private_region_bytes')/1MB)
+"committed mapped         (committed_mapped_bytes)    {0,8:N0} MB   the driver maps what it allocates" -f ($cm/1MB)
+"committed images         (committed_image_bytes)     {0,8:N0} MB" -f ($ci/1MB)
+"of which we can account for:"
+"  Rust heap, live        (rust_heap_bytes)           {0,8:N0} MB" -f ((Last 'rust_heap_bytes')/1MB)
+"  graphics allocator     (allocator_reserved_bytes)  {0,8:N0} MB" -f ((Last 'allocator_reserved_bytes')/1MB)
+$unaccounted = $cp + $cm - (Last 'rust_heap_bytes') - (Last 'allocator_reserved_bytes')
+"  everything else                                    {0,8:N0} MB   was 3,864 MB last run" -f ($unaccounted/1MB)
+Write-Host "  private climbing with the Rust heap flat is a heap that has stopped giving pages back;"
+Write-Host "  mapped climbing is the graphics driver. Last run could not tell the two apart."
+
 Write-Host ""
 Write-Host "=== FRAME TIME ================================================"
 "frames drawn              (frames)                   {0,8:N0}" -f $frames

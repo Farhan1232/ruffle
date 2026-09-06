@@ -100,6 +100,22 @@ impl FrameTimes {
     }
 }
 
+/// The whole header, core's columns wrapped in the ones the frontend adds.
+///
+/// One function rather than a literal at the write site, so that the test which
+/// checks the verifier can find its columns is checking the same string the log
+/// is written with.
+fn csv_header(core_columns: String) -> String {
+    format!(
+        "rss_bytes,peak_rss_bytes,private_bytes,peak_private_bytes,{core_columns},\
+         peak_gpu_texture_bytes_sampled,rust_heap_bytes,\
+         frames,frame_ms_mean,frame_ms_p50,frame_ms_p95,frame_ms_p99,frame_ms_max,\
+         frames_over_33ms,frames_over_100ms,\
+         committed_private_bytes,committed_mapped_bytes,committed_image_bytes,\
+         committed_private_regions,largest_private_region_bytes"
+    )
+}
+
 pub struct MemoryReporter {
     output: BufWriter<File>,
     interval: Duration,
@@ -169,21 +185,20 @@ impl MemoryReporter {
             self.header_written = true;
             if let Err(e) = writeln!(
                 self.output,
-                "rss_bytes,peak_rss_bytes,private_bytes,peak_private_bytes,{},\
-                 peak_gpu_texture_bytes_sampled,rust_heap_bytes,\
-                 frames,frame_ms_mean,frame_ms_p50,frame_ms_p95,frame_ms_p99,frame_ms_max,\
-                 frames_over_33ms,frames_over_100ms",
-                MemoryReport::csv_header_for(report.texture_kind_names())
+                "{}",
+                csv_header(MemoryReport::csv_header_for(report.texture_kind_names()))
             ) {
                 tracing::error!("Could not write memory report header: {e}");
             }
         }
 
         let rust_heap = rust_heap_bytes();
+        let space = address_space();
         let (frames, mean, p50, p95, p99, max, long, very_long) = self.frame_times.drain_stats();
         if let Err(e) = writeln!(
             self.output,
-            "{},{},{},{},{},{},{},{},{mean:.2},{p50:.2},{p95:.2},{p99:.2},{max:.2},{long},{very_long}",
+            "{},{},{},{},{},{},{},{},{mean:.2},{p50:.2},{p95:.2},{p99:.2},{max:.2},{long},{very_long},\
+             {},{},{},{},{}",
             rss,
             self.peak_rss,
             private,
@@ -192,6 +207,11 @@ impl MemoryReporter {
             self.peak_gpu_texture_bytes,
             rust_heap,
             frames,
+            space.private,
+            space.mapped,
+            space.image,
+            space.private_regions,
+            space.largest_private_region,
         )
         .and_then(|_| self.output.flush())
         {
@@ -377,4 +397,183 @@ fn resident_set_size() -> Option<usize> {
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn private_bytes() -> Option<usize> {
     None
+}
+
+/// What the process's committed address space is made of.
+///
+/// The reason this exists: over the client's 40-minute session, private bytes
+/// minus the Rust heap's live bytes minus the graphics allocator's whole
+/// reserve went from 161 MB to 3,864 MB, and every counter the client and the
+/// renderer keep was flat across the same run. The growth is real and it is
+/// outside both instruments, so the next question is which side of the process
+/// it is on, and no counter we own can answer it.
+///
+/// The operating system can. Committed memory is either private to the process
+/// - which is where a heap that has stopped giving pages back would show, the
+/// Rust heap included - or a mapping of something else, which is where the
+/// graphics driver's own memory shows, since it maps what it allocates rather
+/// than committing it privately. One number each, sampled beside the rest.
+///
+/// It is a walk of the region table rather than of the pages, so it costs
+/// microseconds and is safe to take every five seconds.
+#[derive(Clone, Copy, Default)]
+pub struct AddressSpace {
+    pub private: u64,
+    pub mapped: u64,
+    pub image: u64,
+    pub private_regions: u64,
+    pub largest_private_region: u64,
+}
+
+#[cfg(windows)]
+pub fn address_space() -> AddressSpace {
+    use std::mem::{size_of, zeroed};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+
+    let mut info: SYSTEM_INFO = unsafe { zeroed() };
+    // SAFETY: `info` is a valid, correctly sized `SYSTEM_INFO` to write into.
+    unsafe { GetSystemInfo(&mut info) };
+    let mut address = info.lpMinimumApplicationAddress as usize;
+    let maximum = info.lpMaximumApplicationAddress as usize;
+
+    let mut census = AddressSpace::default();
+    while address < maximum {
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { zeroed() };
+        // SAFETY: `mbi` is a valid, correctly sized structure to write into,
+        // and `address` is only ever a region boundary this walk was given.
+        let written = unsafe {
+            VirtualQuery(
+                address as *const _,
+                &mut mbi,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if written == 0 {
+            break;
+        }
+        let size = mbi.RegionSize as u64;
+        if mbi.State == MEM_COMMIT {
+            match mbi.Type {
+                MEM_PRIVATE => {
+                    census.private += size;
+                    census.private_regions += 1;
+                    census.largest_private_region = census.largest_private_region.max(size);
+                }
+                MEM_MAPPED => census.mapped += size,
+                MEM_IMAGE => census.image += size,
+                _ => {}
+            }
+        }
+        // A region that does not advance would spin the walk forever.
+        let next = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+        if next <= address {
+            break;
+        }
+        address = next;
+    }
+    census
+}
+
+/// The same census from `/proc/self/maps`, so the columns mean something on the
+/// machine the work is done on as well as on the one it is measured on.
+///
+/// An anonymous mapping is the counterpart of Windows' private commit, and a
+/// file-backed one of its mapped and image regions. The split is coarser -
+/// Linux does not distinguish an image from any other file mapping here, so
+/// executables and libraries are counted as images by their permissions - but
+/// the question it answers is the same one.
+#[cfg(target_os = "linux")]
+pub fn address_space() -> AddressSpace {
+    let mut census = AddressSpace::default();
+    let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
+        return census;
+    };
+    for line in maps.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(range) = fields.next() else { continue };
+        let Some((start, end)) = range.split_once('-') else {
+            continue;
+        };
+        let (Ok(start), Ok(end)) = (u64::from_str_radix(start, 16), u64::from_str_radix(end, 16))
+        else {
+            continue;
+        };
+        let size = end.saturating_sub(start);
+        let permissions = fields.next().unwrap_or("");
+        // offset, device, inode, then the path if there is one.
+        let path = fields.nth(3).unwrap_or("");
+        if path.is_empty() {
+            census.private += size;
+            census.private_regions += 1;
+            census.largest_private_region = census.largest_private_region.max(size);
+        } else if permissions.contains('x') {
+            census.image += size;
+        } else {
+            census.mapped += size;
+        }
+    }
+    census
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn address_space() -> AddressSpace {
+    AddressSpace::default()
+}
+
+#[cfg(test)]
+mod address_space_tests {
+    use super::address_space;
+
+    /// The verifier reads these by name, and a column it cannot find is a
+    /// figure nobody sees. The core half of the header has its own test; this
+    /// is the half the desktop frontend adds.
+    #[test]
+    fn the_header_carries_the_census_columns() {
+        let header = super::csv_header(String::from("elapsed_s"));
+        for wanted in [
+            "committed_private_bytes",
+            "committed_mapped_bytes",
+            "committed_image_bytes",
+            "committed_private_regions",
+            "largest_private_region_bytes",
+            "rust_heap_bytes",
+        ] {
+            assert!(
+                header.split(',').any(|column| column.trim() == wanted),
+                "the memory report header has no `{wanted}` column"
+            );
+        }
+    }
+
+    /// A smoke test, because a census that silently reports nothing would look
+    /// exactly like a process that is holding nothing - and the whole point of
+    /// these columns is to be believed when they are large.
+    #[test]
+    fn the_census_finds_this_process() {
+        let space = address_space();
+        assert!(
+            space.private > 1024 * 1024,
+            "a running test process has more than a megabyte of private commit; \
+             the census reported {} bytes over {} regions",
+            space.private,
+            space.private_regions
+        );
+        assert!(
+            space.private_regions > 0 && space.largest_private_region > 0,
+            "regions {} largest {}",
+            space.private_regions,
+            space.largest_private_region
+        );
+        println!(
+            "private {:.1} MB over {} regions (largest {:.1} MB), mapped {:.1} MB, image {:.1} MB",
+            space.private as f64 / (1024.0 * 1024.0),
+            space.private_regions,
+            space.largest_private_region as f64 / (1024.0 * 1024.0),
+            space.mapped as f64 / (1024.0 * 1024.0),
+            space.image as f64 / (1024.0 * 1024.0),
+        );
+    }
 }
