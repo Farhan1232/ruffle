@@ -568,6 +568,7 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
     rect: TargetRect,
     nearest_layer: LayerRef,
     texture_pool: &'encoder mut TexturePool,
+    backdrop_is_opaque: bool,
 ) -> ChunkedCommands {
     WgpuCommandHandler::new(
         descriptors,
@@ -579,6 +580,7 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
         rect,
         nearest_layer,
         texture_pool,
+        backdrop_is_opaque,
     )
     .chunk_blends(commands)
 }
@@ -612,6 +614,15 @@ struct WgpuCommandHandler<'encoder, 'global: 'encoder> {
     /// Whether the draws being built belong to a page rather than to the
     /// surface.
     paging: bool,
+    /// Whether the destination these commands are drawn onto is known to have
+    /// no transparency anywhere.
+    ///
+    /// True when the target was cleared with a fully opaque colour and nothing
+    /// since has written alpha back out of it. It is what permits a multiply to
+    /// be carried by its own draw - see
+    /// [`TrivialBlend::MultiplyOpaque`](crate::blend::TrivialBlend::MultiplyOpaque)
+    /// for the algebra - and it is only ever allowed to under-report.
+    backdrop_is_opaque: bool,
 }
 
 impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
@@ -626,6 +637,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
         rect: TargetRect,
         nearest_layer: LayerRef<'encoder>,
         texture_pool: &'encoder mut TexturePool,
+        backdrop_is_opaque: bool,
     ) -> Self {
         let transforms = Self::new_transforms(descriptors, dynamic_transforms);
         let vertices = Self::new_vertices(descriptors, dynamic_transforms);
@@ -668,6 +680,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
             needs_stencil: false,
             num_masks: 0,
             paging: false,
+            backdrop_is_opaque,
         }
     }
 
@@ -1082,16 +1095,36 @@ fn page_reserve(commands: &CommandList, emulate_lines: bool) -> (usize, usize) {
 /// single unconditional draw - a second command, a mask around it, a nested
 /// blend, a shape whose pipelines have no blend-state variants - keeps the
 /// target.
+///
+/// `destination_is_opaque` says whether the surface underneath has no
+/// transparency anywhere, which is what lets a multiply join them: it is the
+/// one complex blend that a blend state expresses exactly, and only under that
+/// condition.
 fn trivial_fast_path(
     commands: &CommandList,
     blend_type: &BlendType,
-) -> Result<(), crate::FallbackReason> {
+    destination_is_opaque: bool,
+) -> Result<TrivialBlend, crate::FallbackReason> {
     use crate::FallbackReason;
+    use crate::render_stats::MultiplyOnDraw;
 
     // A complex blend reads the destination in a shader and genuinely needs the
     // group rendered out first; a PixelBender blend is arbitrary code.
     let trivial = match blend_type {
-        BlendType::Trivial(trivial) => trivial,
+        BlendType::Trivial(trivial) => *trivial,
+        // Except this one. AQW builds most of its artwork out of layers
+        // multiplied over what is already drawn, and over an opaque
+        // destination the shader's expression collapses to a blend state, so
+        // the sub-target, its render pass and its composite all disappear.
+        BlendType::Complex(ComplexBlend::Multiply) if crate::tuning::multiply_on_draw_enabled() => {
+            if !destination_is_opaque {
+                crate::render_stats::record_multiply_on_draw(
+                    MultiplyOnDraw::TransparentDestination,
+                );
+                return Err(FallbackReason::ComplexBlend);
+            }
+            TrivialBlend::MultiplyOpaque
+        }
         BlendType::Complex(_) | BlendType::Shader(_) => {
             return Err(FallbackReason::ComplexBlend);
         }
@@ -1114,7 +1147,15 @@ fn trivial_fast_path(
     // This still covers `BlendMode::LAYER`, which is the mode that wraps a
     // group so it composites as a unit, and so the one a cached or filtered
     // display object arrives under.
-    if !matches!(trivial, TrivialBlend::Normal) {
+    //
+    // `MultiplyOpaque` joins it, and the same algebra is why. Drawn directly,
+    // a pixel of coverage `c` resolves to `c*(dst*src + dst*(1 - a)) +
+    // (1 - c)*dst`, which is `dst*(c*src + 1 - c*a)`. Through a target, the
+    // group resolves to a premultiplied `(c*src, c*a)` first and the shader
+    // then writes `dst*(c*src) + dst*(1 - c*a)` - the same value. Multiply is
+    // linear in the source and, for a premultiplied source where `src <= a`,
+    // cannot saturate, so there is no clamp to disagree about.
+    if !matches!(trivial, TrivialBlend::Normal | TrivialBlend::MultiplyOpaque) {
         return Err(FallbackReason::UnsupportedBlendMode);
     }
 
@@ -1127,12 +1168,20 @@ fn trivial_fast_path(
         // object reaches the renderer as exactly one `render_bitmap` of its
         // cache texture, which is what most of a crowded room's blended
         // objects are.
-        Command::RenderBitmap { .. } => Ok(()),
+        Command::RenderBitmap { .. } => Ok(trivial),
         // Shapes are drawn through the colour, gradient and bitmap-fill
         // pipelines, which are only built with premultiplied-alpha blending;
         // there is no `Add` or `Screen` variant of them to select.
-        Command::RenderShape { .. }
-        | Command::DrawRect { .. }
+        Command::RenderShape { .. } => {
+            // Counted rather than assumed: a multiply that got this far is one
+            // that building those variants would win, and the number decides
+            // whether building them is worth it.
+            if matches!(trivial, TrivialBlend::MultiplyOpaque) {
+                crate::render_stats::record_multiply_on_draw(MultiplyOnDraw::SoleShape);
+            }
+            Err(FallbackReason::UnsupportedCommand)
+        }
+        Command::DrawRect { .. }
         | Command::DrawLine { .. }
         | Command::DrawLineRect { .. }
         | Command::RenderStage3D { .. } => Err(FallbackReason::UnsupportedCommand),
@@ -1153,13 +1202,33 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
         };
         let blend_type = BlendType::from(blend_mode);
 
-        // A group of one drawable does not need a target of its own.
-        match trivial_fast_path(&commands, &blend_type) {
-            Ok(()) => {
+        // `Alpha` and `Erase` are the two blends whose shaders write alpha back
+        // out of the destination - every other one leaves `dst.a` at least what
+        // it was. Once either has run, the surface is no longer known opaque
+        // and no later multiply may be carried by its draw.
+        // A PixelBender blend joins them: it is arbitrary code and may write
+        // any alpha it likes.
+        if matches!(
+            blend_type,
+            BlendType::Complex(ComplexBlend::Alpha)
+                | BlendType::Complex(ComplexBlend::Erase)
+                | BlendType::Shader(_)
+        ) {
+            self.backdrop_is_opaque = false;
+        }
+
+        // A group of one drawable does not need a target of its own. A page is
+        // cleared transparent, so a group being drawn into one is not over the
+        // opaque surface even when the surface is opaque.
+        let destination_is_opaque = self.backdrop_is_opaque && !self.paging;
+        match trivial_fast_path(&commands, &blend_type, destination_is_opaque) {
+            Ok(blend_mode) => {
                 crate::render_stats::record_fastpath(true, None);
-                let BlendType::Trivial(blend_mode) = blend_type else {
-                    unreachable!("the fast path only accepts trivial blends")
-                };
+                if matches!(blend_mode, TrivialBlend::MultiplyOpaque) {
+                    crate::render_stats::record_multiply_on_draw(
+                        crate::render_stats::MultiplyOnDraw::Used,
+                    );
+                }
                 let Some(Command::RenderBitmap {
                     bitmap,
                     transform,

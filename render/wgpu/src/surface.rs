@@ -137,6 +137,15 @@ impl Surface {
         nearest_layer: LayerRef<'encoder>,
         texture_pool: &'encoder mut TexturePool,
     ) -> CommandTarget {
+        // Asked before the mode is consumed. A target cleared with a fully
+        // opaque colour has no transparency anywhere until something writes
+        // alpha back into it, and that is the condition under which a multiply
+        // is a blend state rather than a shader. A target cleared from an
+        // existing texture says nothing about its contents, so it counts as not
+        // opaque - this may only ever under-report.
+        let backdrop_is_opaque = render_target_mode
+            .color()
+            .is_some_and(|color| color.a >= 1.0);
         let target = CommandTarget::new(
             descriptors,
             texture_pool,
@@ -170,6 +179,7 @@ impl Surface {
                 layer => layer,
             },
             texture_pool,
+            backdrop_is_opaque,
         );
 
         // Consecutive complex blends that cannot see each other's work are
