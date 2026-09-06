@@ -323,6 +323,9 @@ pub mod render_stats {
     static PEAK_BLEND_TARGET_BYTES: AtomicUsize = AtomicUsize::new(0);
     static FASTPATH_ELIGIBLE: AtomicU64 = AtomicU64::new(0);
     static FASTPATH_USED: AtomicU64 = AtomicU64::new(0);
+    static MULTIPLY_ON_DRAW_USED: AtomicU64 = AtomicU64::new(0);
+    static MULTIPLY_ON_DRAW_SHAPE: AtomicU64 = AtomicU64::new(0);
+    static MULTIPLY_ON_DRAW_TRANSPARENT: AtomicU64 = AtomicU64::new(0);
 
     /// Why a blend could not take the direct path. Kept as counters rather
     /// than log lines: a crowded frame asks the question hundreds of times.
@@ -574,6 +577,37 @@ pub mod render_stats {
         COMPLEX_BLEND_PASSES.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// What became of a multiply that could have been carried by its own draw.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum MultiplyOnDraw {
+        /// Carried: no target, no pass, no composite.
+        Used,
+        /// The destination was opaque and the group was a single draw, but that
+        /// draw was a shape.
+        ///
+        /// Two things stand in the way, and this counter is what says whether
+        /// clearing them is worth it. The shape pipelines are only built with
+        /// premultiplied-alpha blending, so there is no multiply variant to
+        /// select; and a shape is a mesh of several draws, which a target
+        /// composites into one picture before the blend applies. Carrying the
+        /// blend on each draw instead would multiply the destination once per
+        /// draw wherever two of them overlap, so a mesh may only take this path
+        /// if it is a single draw.
+        SoleShape,
+        /// The destination was not known to be opaque, so the algebra does not
+        /// hold and the shader has to run.
+        TransparentDestination,
+    }
+
+    pub(crate) fn record_multiply_on_draw(outcome: MultiplyOnDraw) {
+        match outcome {
+            MultiplyOnDraw::Used => &MULTIPLY_ON_DRAW_USED,
+            MultiplyOnDraw::SoleShape => &MULTIPLY_ON_DRAW_SHAPE,
+            MultiplyOnDraw::TransparentDestination => &MULTIPLY_ON_DRAW_TRANSPARENT,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_fastpath(used: bool, reason: Option<FallbackReason>) {
         FASTPATH_ELIGIBLE.fetch_add(1, Ordering::Relaxed);
         if used {
@@ -598,6 +632,11 @@ pub mod render_stats {
         pub fastpath_eligible: u64,
         pub fastpath_used: u64,
         pub fallbacks: Vec<u64>,
+        /// Multiplies carried by their own draw, and the two reasons the rest
+        /// were not. `used` is a subset of `fastpath_used`.
+        pub multiply_on_draw_used: u64,
+        pub multiply_on_draw_shape: u64,
+        pub multiply_on_draw_transparent: u64,
         /// Render passes encoded for the most recent frame.
         pub render_passes_last_frame: u64,
         /// Blended groups offered a shared page, and the ones that took a
@@ -638,6 +677,9 @@ pub mod render_stats {
                 .iter()
                 .map(|c| c.load(Ordering::Relaxed))
                 .collect(),
+            multiply_on_draw_used: MULTIPLY_ON_DRAW_USED.load(Ordering::Relaxed),
+            multiply_on_draw_shape: MULTIPLY_ON_DRAW_SHAPE.load(Ordering::Relaxed),
+            multiply_on_draw_transparent: MULTIPLY_ON_DRAW_TRANSPARENT.load(Ordering::Relaxed),
             render_passes_last_frame: LAST_FRAME_RENDER_PASSES.load(Ordering::Relaxed),
             batch_eligible: BATCH_ELIGIBLE.load(Ordering::Relaxed),
             batch_used: BATCH_USED.load(Ordering::Relaxed),
@@ -684,6 +726,7 @@ pub mod tuning {
     static BLEND_PAGES: AtomicBool = AtomicBool::new(true);
     static BLEND_BATCHING: AtomicBool = AtomicBool::new(true);
     static CACHE_POOL: AtomicBool = AtomicBool::new(true);
+    static MULTIPLY_ON_DRAW: AtomicBool = AtomicBool::new(true);
 
     /// Whether blended groups share pages instead of each taking a target.
     pub fn blend_pages_enabled() -> bool {
@@ -702,6 +745,18 @@ pub mod tuning {
 
     pub fn set_blend_batching_enabled(enabled: bool) {
         BLEND_BATCHING.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Whether a multiply over an opaque destination is carried by the draw
+    /// that produced it instead of taking a target, a render pass and a
+    /// composite of its own. Off, every multiply goes through the shader, which
+    /// is exactly the phase 2 behaviour.
+    pub fn multiply_on_draw_enabled() -> bool {
+        MULTIPLY_ON_DRAW.load(Ordering::Relaxed)
+    }
+
+    pub fn set_multiply_on_draw_enabled(enabled: bool) {
+        MULTIPLY_ON_DRAW.store(enabled, Ordering::Relaxed);
     }
 
     /// Whether released `cacheAsBitmap` textures are recycled instead of
