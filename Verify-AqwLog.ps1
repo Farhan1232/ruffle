@@ -4,7 +4,7 @@
 # the output looks like a column that does not exist.
 param(
     [string]$Dir = "$PWD",
-    [string]$ExpectedInstrumentation = "aqw-final-diag-5"
+    [string]$ExpectedInstrumentation = "aqw-final-diag-6"
 )
 
 $ErrorActionPreference = "Stop"
@@ -216,6 +216,8 @@ $ci = Last 'committed_image_bytes';   $cr = Last 'committed_private_regions'
 "  graphics allocator     (allocator_reserved_bytes)  {0,8:N0} MB" -f ((Last 'allocator_reserved_bytes')/1MB)
 $unaccounted = $cp + $cm - (Last 'rust_heap_bytes') - (Last 'allocator_reserved_bytes')
 "  everything else                                    {0,8:N0} MB   was 3,864 MB last run" -f ($unaccounted/1MB)
+Write-Host "  The build writes the same arithmetic, with growth rates and a verdict, to"
+Write-Host "  <log>.summary.txt beside this file. Send that too - it is the short answer."
 Write-Host "  private climbing with the Rust heap flat is a heap that has stopped giving pages back;"
 Write-Host "  mapped climbing is the graphics driver. Last run could not tell the two apart."
 

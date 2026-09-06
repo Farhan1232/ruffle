@@ -106,13 +106,19 @@ impl FrameTimes {
 /// checks the verifier can find its columns is checking the same string the log
 /// is written with.
 fn csv_header(core_columns: String) -> String {
+    // Built from the same array the buckets are filled from, so a bucket
+    // cannot be added without its column appearing beside it.
+    let buckets: String = SIZE_BUCKET_NAMES
+        .iter()
+        .map(|name| format!(",private_{name}"))
+        .collect();
     format!(
         "rss_bytes,peak_rss_bytes,private_bytes,peak_private_bytes,{core_columns},\
          peak_gpu_texture_bytes_sampled,rust_heap_bytes,\
          frames,frame_ms_mean,frame_ms_p50,frame_ms_p95,frame_ms_p99,frame_ms_max,\
          frames_over_33ms,frames_over_100ms,\
          committed_private_bytes,committed_mapped_bytes,committed_image_bytes,\
-         committed_private_regions,largest_private_region_bytes"
+         committed_private_regions,largest_private_region_bytes{buckets}"
     )
 }
 
@@ -131,6 +137,12 @@ pub struct MemoryReporter {
     /// The header names one group of columns per texture kind, and only the
     /// renderer knows those names, so it is written with the first sample.
     header_written: bool,
+    /// Every sample so far, so the classification can be made from the whole
+    /// run at every sample rather than only when the process exits - which is
+    /// not how these runs end.
+    history: Vec<crate::memory_classify::Sample>,
+    /// Where the summary is written, beside the log.
+    summary_path: std::path::PathBuf,
     /// Running maxima across samples, so a row states the high-water mark
     /// beside the current value.
     peak_gpu_texture_bytes: usize,
@@ -156,10 +168,26 @@ impl MemoryReporter {
             last_created_bytes: None,
             last_elapsed: 0.0,
             header_written: false,
+            history: Vec::new(),
+            summary_path: path.with_extension("summary.txt"),
             peak_gpu_texture_bytes: 0,
             peak_rss: 0,
             peak_private: 0,
         })
+    }
+
+    /// Rewrites the summary beside the log.
+    ///
+    /// Every sample, and overwriting rather than appending, because a
+    /// diagnostic session ends by being closed or killed rather than by
+    /// returning, and a summary that only exists on a clean exit is a summary
+    /// nobody ever reads.
+    fn write_summary(&self) {
+        let classification = crate::memory_classify::classify(&self.history);
+        let text = crate::memory_classify::summary(&self.history, &classification);
+        if let Err(e) = std::fs::write(&self.summary_path, text) {
+            tracing::error!("Could not write memory summary: {e}");
+        }
     }
 
     /// Takes a sample if the interval has elapsed. Cheap to call every frame.
@@ -194,11 +222,31 @@ impl MemoryReporter {
 
         let rust_heap = rust_heap_bytes();
         let space = address_space();
+        let allocator = report.allocator.unwrap_or_default();
+        self.history.push(crate::memory_classify::Sample {
+            elapsed_s: elapsed,
+            working_set: rss as u64,
+            private_bytes: private as u64,
+            rust_heap: rust_heap as u64,
+            allocator_allocated: allocator.allocated_bytes,
+            allocator_reserved: allocator.reserved_bytes,
+            committed_private: space.private,
+            committed_mapped: space.mapped,
+            committed_image: space.image,
+            private_regions: space.private_regions,
+            largest_private_region: space.largest_private_region,
+            private_by_size: space.private_by_size,
+            render_passes_last_frame: report.work.render_passes,
+            complex_blends: report.work.complex_blends,
+            destination_copies: report.work.destination_copies,
+            offscreen_builds: report.work.offscreen_pool_misses.iter().sum(),
+        });
+        self.write_summary();
         let (frames, mean, p50, p95, p99, max, long, very_long) = self.frame_times.drain_stats();
         if let Err(e) = writeln!(
             self.output,
             "{},{},{},{},{},{},{},{},{mean:.2},{p50:.2},{p95:.2},{p99:.2},{max:.2},{long},{very_long},\
-             {},{},{},{},{}",
+             {},{},{},{},{},{},{},{},{},{}",
             rss,
             self.peak_rss,
             private,
@@ -212,6 +260,11 @@ impl MemoryReporter {
             space.image,
             space.private_regions,
             space.largest_private_region,
+            space.private_by_size[0],
+            space.private_by_size[1],
+            space.private_by_size[2],
+            space.private_by_size[3],
+            space.private_by_size[4],
         )
         .and_then(|_| self.output.flush())
         {
@@ -423,6 +476,33 @@ pub struct AddressSpace {
     pub image: u64,
     pub private_regions: u64,
     pub largest_private_region: u64,
+    /// Committed private bytes by region size, in the buckets named by
+    /// [`SIZE_BUCKET_NAMES`].
+    ///
+    /// This is what separates the two things private commit can be. A heap
+    /// grows by taking segments, so a heap that is retaining shows as a great
+    /// many regions in the middle buckets; a driver's arenas are few and large.
+    /// Without it, "private is growing" leaves our allocator and the display
+    /// driver's own heaps indistinguishable.
+    pub private_by_size: [u64; 5],
+}
+
+/// The edges of [`AddressSpace::private_by_size`], in bytes.
+const SIZE_BUCKET_EDGES: [u64; 4] = [64 * 1024, 1024 * 1024, 16 * 1024 * 1024, 256 * 1024 * 1024];
+
+pub const SIZE_BUCKET_NAMES: [&str; 5] = [
+    "under_64kb",
+    "64kb_to_1mb",
+    "1mb_to_16mb",
+    "16mb_to_256mb",
+    "over_256mb",
+];
+
+fn size_bucket(size: u64) -> usize {
+    SIZE_BUCKET_EDGES
+        .iter()
+        .position(|edge| size < *edge)
+        .unwrap_or(SIZE_BUCKET_EDGES.len())
 }
 
 #[cfg(windows)]
@@ -461,6 +541,7 @@ pub fn address_space() -> AddressSpace {
                     census.private += size;
                     census.private_regions += 1;
                     census.largest_private_region = census.largest_private_region.max(size);
+                    census.private_by_size[size_bucket(size)] += size;
                 }
                 MEM_MAPPED => census.mapped += size,
                 MEM_IMAGE => census.image += size,
@@ -509,6 +590,7 @@ pub fn address_space() -> AddressSpace {
             census.private += size;
             census.private_regions += 1;
             census.largest_private_region = census.largest_private_region.max(size);
+            census.private_by_size[size_bucket(size)] += size;
         } else if permissions.contains('x') {
             census.image += size;
         } else {
@@ -540,12 +622,30 @@ mod address_space_tests {
             "committed_private_regions",
             "largest_private_region_bytes",
             "rust_heap_bytes",
+            "private_under_64kb",
+            "private_over_256mb",
         ] {
             assert!(
                 header.split(',').any(|column| column.trim() == wanted),
                 "the memory report header has no `{wanted}` column"
             );
         }
+
+        // The row writer emits one field per bucket; a header that has grown a
+        // bucket the row has not would silently shift every column after it.
+        let bucket_columns = super::SIZE_BUCKET_NAMES
+            .iter()
+            .filter(|name| {
+                let wanted = format!("private_{name}");
+                header.split(',').any(|column| column.trim() == wanted)
+            })
+            .count();
+        assert_eq!(
+            bucket_columns,
+            super::SIZE_BUCKET_NAMES.len(),
+            "the header carries {bucket_columns} of the {} bucket columns",
+            super::SIZE_BUCKET_NAMES.len()
+        );
     }
 
     /// A smoke test, because a census that silently reports nothing would look

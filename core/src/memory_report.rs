@@ -17,7 +17,7 @@ use crate::context::UpdateContext;
 
 /// Identifies this instrumentation, so a log can be tied to the build that
 /// produced it. Bump it whenever the columns change.
-pub const INSTRUMENTATION_VERSION: &str = "aqw-final-diag-5";
+pub const INSTRUMENTATION_VERSION: &str = "aqw-final-diag-6";
 
 /// What a single still-resident movie is keeping alive.
 #[derive(Debug, Clone)]

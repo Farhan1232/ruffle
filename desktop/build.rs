@@ -24,7 +24,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Note: We check CARGO_CFG_TARGET_OS rather than cfg! because build.rs
     // runs on the host, not the target.
     let target_os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS not set");
-    if target_os == "windows" {
+    // The icon and version block need a Windows resource compiler, which a
+    // Linux box does not have. Skipping it is what lets the Windows-only halves
+    // of this crate be typechecked from here with
+    // `cargo check --target x86_64-pc-windows-gnu`, which is the only way the
+    // code that reads Windows' address space gets compiled before it is handed
+    // to the person who runs it. It only ever affects an executable's icon, and
+    // never one that is built to be shipped.
+    println!("cargo:rerun-if-env-changed=RUFFLE_SKIP_WINDOWS_RESOURCE");
+    let skip_resource = env::var("RUFFLE_SKIP_WINDOWS_RESOURCE").is_ok_and(|v| v == "1");
+    if target_os == "windows" && !skip_resource {
         set_windows_resource()?;
     }
 
